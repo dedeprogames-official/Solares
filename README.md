@@ -1,9 +1,11 @@
 <div align="center">
 
-<h1>Solares</h1>
+<h3>Solares</h3>
 
-**A realistic Minecraft shader designed by me.**
+A realistic Minecraft shaders designed by me.
 
 <img src="example.png" width="900">
 
 </div>
+
+Solares is a Minecraft shader created by DedeProGames, designed for natural realism.
