@@ -4,6 +4,6 @@
 
 **A realistic Minecraft shader designed by me.**
 
-<img src="examples/example1.png" width="900">
+<img src="example.png" width="900">
 
 </div>
