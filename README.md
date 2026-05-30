@@ -1,9 +1,9 @@
 <div align="center">
 
-# Solares
+<h1>Solares</h1>
 
 **A realistic Minecraft shader designed by me.**
 
-![Example](examples/example1.png)
+<img src="examples/example1.png" width="900">
 
 </div>
