@@ -6,13 +6,13 @@
 <title>Gothic Water Channel</title>
 <style>
   *{margin:0;padding:0;overflow:hidden}
-  body{background:#a9adb2}
+  body{background:#8f959c}
   canvas{display:block}
-  #info{position:absolute;bottom:12px;left:50%;transform:translateX(-50%);color:rgba(255,255,255,.35);font:12px/1 system-ui,sans-serif;pointer-events:none}
+  #info{position:absolute;bottom:12px;left:50%;transform:translateX(-50%);color:rgba(255,255,255,.4);font:12px/1.5 system-ui,sans-serif;pointer-events:none;text-align:center}
 </style>
 </head>
 <body>
-<div id="info">Gothic Water Channel — Three.js</div>
+<div id="info">Gothic Water Channel — Three.js<br><span id="audioHint">clique para ativar o som da tempestade</span></div>
 
 <script type="importmap">
 {
@@ -27,282 +27,836 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
-/* ─────────────────────────────────────────────
+/* ═════════════════════════════════════════════
    0. PALETA / ATMOSFERA
-   Tudo que define o "clima" da cena mora aqui.
-   ───────────────────────────────────────────── */
-const FOG_COLOR    = new THREE.Color(0xa9adb2); // cinza-claro da referência
-const SKY_ZENITH   = new THREE.Color(0x9ca1a8);
-const SKY_HORIZON  = new THREE.Color(0xb6b9bd);
-const FOG_DENSITY  = 0.0105;                    // névoa pesada: some em ~120u
+   ═════════════════════════════════════════════ */
+const FOG_COLOR   = new THREE.Color(0xa5abb1);
+const FOG_DENSITY = 0.0110;
 
-const WATER_DEEP    = new THREE.Color(0x1c5f5f);
-const WATER_SHALLOW = new THREE.Color(0x3f9d96);
-const WATER_CREST   = new THREE.Color(0xa8dcd8);
+const SKY_ZENITH  = new THREE.Color(0x939aa1);
+const SKY_HORIZON = new THREE.Color(0xb9bfc4);
+const CLOUD_DARK  = new THREE.Color(0x767d86);
+const CLOUD_LIGHT = new THREE.Color(0xccd1d6);
 
-/* ─────────────────────────────────────────────
-   1. CORE SETUP
-   ───────────────────────────────────────────── */
+const WATER_DEEP    = new THREE.Color(0x22635d);
+const WATER_SHALLOW = new THREE.Color(0x58b6a8);
+const WATER_SCATTER = new THREE.Color(0x6fd6c0); // luz atravessando a crista
+const WALL_COLOR    = new THREE.Color(0x2a2e35); // torres refletidas na água
+
+/* ═════════════════════════════════════════════
+   1. CORE
+   ═════════════════════════════════════════════ */
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
 renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.75));
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.15;
+renderer.toneMappingExposure = 1.1;
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
 scene.background = FOG_COLOR.clone();
 scene.fog = new THREE.FogExp2(FOG_COLOR.getHex(), FOG_DENSITY);
 
-const camera = new THREE.PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.3, 800);
-camera.position.set(0, 1.8, 30);
+const camera = new THREE.PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.3, 900);
+camera.position.set(0, 2.6, 30);
 
-/* ─────────────────────────────────────────────
-   2. LUZ — dia encoberto, quase sem direcional
-   ───────────────────────────────────────────── */
-scene.add(new THREE.AmbientLight(0x9aa0a8, 0.75));
-scene.add(new THREE.HemisphereLight(0xc2c6cc, 0x30343a, 0.85));
+/* ═════════════════════════════════════════════
+   2. UNIFORMS COMPARTILHADOS
+   Os mesmos objetos vão para céu, água e chuva:
+   atualizar um atualiza todos.
+   ═════════════════════════════════════════════ */
+const U = {
+  uTime:       { value: 0 },
+  uFlash:      { value: 0 },
+  uStrikeDir:  { value: new THREE.Vector3(1, 0.5, 0).normalize() },
+  uZenith:     { value: SKY_ZENITH },
+  uHorizon:    { value: SKY_HORIZON },
+  uCloudDark:  { value: CLOUD_DARK },
+  uCloudLight: { value: CLOUD_LIGHT },
+  uCloudCover: { value: 0.92 },
+  uCloudSpeed: { value: 0.0045 },
+  uFogColor:   { value: FOG_COLOR },
+  uFogDensity: { value: FOG_DENSITY },
+};
 
-const dirLight = new THREE.DirectionalLight(0xb8bcc2, 0.25);
+/* ═════════════════════════════════════════════
+   3. LUZ
+   ═════════════════════════════════════════════ */
+scene.add(new THREE.AmbientLight(0x99a0a8, 0.72));
+scene.add(new THREE.HemisphereLight(0xc4cad0, 0x33373d, 0.9));
+
+const dirLight = new THREE.DirectionalLight(0xb2b8bf, 0.22);
 dirLight.position.set(40, 90, 25);
 scene.add(dirLight);
 
-/* ─────────────────────────────────────────────
-   3. ÁGUA
-   Estratégia: a malha carrega apenas as ondas
-   grandes; a ondulação fina (que dá o brilho
-   "enrugado" da referência) é normal analítica
-   calculada no fragment shader — detalhe abaixo
-   do tamanho do triângulo, sem custo de malha.
-   ───────────────────────────────────────────── */
-const WAVE_GLSL = `
-  vec3 mod289(vec3 x){return x-floor(x*(1./289.))*289.;}
-  vec2 mod289(vec2 x){return x-floor(x*(1./289.))*289.;}
-  vec3 permute(vec3 x){return mod289(((x*34.)+1.)*x);}
-  float snoise(vec2 v){
-    const vec4 C = vec4(.211324865,.366025403,-.577350269,.024390243);
-    vec2 i = floor(v+dot(v,C.yy));
-    vec2 x0 = v-i+dot(i,C.xx);
-    vec2 i1 = (x0.x>x0.y)?vec2(1.,0.):vec2(0.,1.);
-    vec4 x12 = x0.xyxy+C.xxzz;
-    x12.xy -= i1;
-    i = mod289(i);
-    vec3 p = permute(permute(i.y+vec3(0.,i1.y,1.))+i.x+vec3(0.,i1.x,1.));
-    vec3 m = max(.5-vec3(dot(x0,x0),dot(x12.xy,x12.xy),dot(x12.zw,x12.zw)),0.);
-    m=m*m;m=m*m;
-    vec3 x = 2.*fract(p*C.www)-1.;
-    vec3 h = abs(x)-.5;
-    vec3 ox = floor(x+.5);
-    vec3 a0 = x-ox;
-    m *= 1.79284291400159-.0853734437090059*(a0*a0+h*h);
-    vec3 g;
-    g.x = a0.x*x0.x+h.x*x0.y;
-    g.yz = a0.yz*x12.xz+h.yz*x12.yw;
-    return 130.*dot(m,g);
-  }
+/* luz do relâmpago: reposicionada a cada descarga */
+const flashLight = new THREE.DirectionalLight(0xcfdcff, 0);
+scene.add(flashLight);
+const flashAmbient = new THREE.AmbientLight(0xb9c8ee, 0);
+scene.add(flashAmbient);
 
-  /* Ondas grandes — deslocam a malha. Amplitude baixa:
-     a referência é picada, não oceânica. */
-  float waveHeight(vec2 p, float t){
-    float h = 0.0;
-    h += sin(p.x*0.09 + t*0.55)*0.30;
-    h += sin(p.y*0.11 - t*0.42 + p.x*0.03)*0.22;
-    h += sin(p.x*0.23 + p.y*0.17 + t*0.95)*0.12;
-    h += sin(p.x*0.41 - p.y*0.33 + t*1.35)*0.07;
-    h += sin(p.y*0.57 + t*1.10)*0.05;
-    return h;
+/* ═════════════════════════════════════════════
+   4. GLSL COMPARTILHADO — ruído, nuvem, céu
+   ═════════════════════════════════════════════ */
+const NOISE_GLSL = `
+  float hash21(vec2 p){
+    p = fract(p * vec2(123.34, 456.21));
+    p += dot(p, p + 45.32);
+    return fract(p.x * p.y);
   }
-
-  float waveHeightDetailed(vec2 p, float t){
-    float h = waveHeight(p, t);
-    h += snoise(vec2(p.x*0.15 + t*0.28, p.y*0.15 + t*0.19)) * 0.18;
-    h += snoise(vec2(p.x*0.42 + t*0.55, p.y*0.42 + t*0.38)) * 0.08;
-    return h;
+  vec2 hash22(vec2 p){
+    float n = hash21(p);
+    return vec2(n, hash21(p + n * 17.13));
+  }
+  float vnoise(vec2 p){
+    vec2 i = floor(p), f = fract(p);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    float a = hash21(i);
+    float b = hash21(i + vec2(1.0, 0.0));
+    float c = hash21(i + vec2(0.0, 1.0));
+    float d = hash21(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+  }
+  float fbm3(vec2 p){
+    mat2 rot = mat2(1.6, 1.2, -1.2, 1.6);
+    float v = 0.0, a = 0.5;
+    for(int i = 0; i < 3; i++){ v += a * vnoise(p); p = rot * p; a *= 0.5; }
+    return v;
+  }
+  float fbm5(vec2 p){
+    mat2 rot = mat2(1.6, 1.2, -1.2, 1.6);
+    float v = 0.0, a = 0.5;
+    for(int i = 0; i < 5; i++){ v += a * vnoise(p); p = rot * p; a *= 0.5; }
+    return v;
   }
 `;
 
-const waterVertexShader = `
-  uniform float uTime;
-  uniform float uSeaSpeed;
-  varying vec3 vWorldPos;
-  varying float vWave;
-  varying vec3 vNormal;
+const SKY_UNIFORMS_GLSL = `
+  uniform vec3  uZenith;
+  uniform vec3  uHorizon;
+  uniform vec3  uCloudDark;
+  uniform vec3  uCloudLight;
+  uniform float uCloudCover;
+  uniform float uCloudSpeed;
+  uniform float uFlash;
+  uniform vec3  uStrikeDir;
+`;
 
-  ${WAVE_GLSL}
+/* Nuvem: projeção do raio de visão numa camada plana + domain warp.
+   `cheap` corta oitavas — a água usa a versão barata no reflexo. */
+const SKY_GLSL = `
+  float cloudField(vec3 dir, float t, bool cheap){
+    float y = max(dir.y, 0.015);
+    vec2 uv = dir.xz / (y + 0.20) * 0.28;
+    uv += vec2(t * uCloudSpeed, t * uCloudSpeed * 0.55);
+    if(cheap){
+      vec2 q = vec2(fbm3(uv), fbm3(uv + vec2(4.7, 2.1)));
+      return fbm3(uv + 1.4 * q);
+    }
+    vec2 q = vec2(fbm3(uv), fbm3(uv + vec2(4.7, 2.1)));
+    vec2 r = vec2(fbm3(uv + 1.4 * q + vec2(1.7, 9.2)), fbm3(uv + 1.4 * q + vec2(8.3, 2.8)));
+    return fbm5(uv + 1.6 * q + 0.6 * r);
+  }
+
+  vec3 skyColor(vec3 dir, float t, bool cheap){
+    vec3 base = mix(uHorizon, uZenith, smoothstep(-0.18, 0.70, dir.y));
+
+    float f = cloudField(dir, t, cheap);
+    float dens = smoothstep(0.28, 0.80, f);
+
+    /* nublado fechado: base escura, bordas claras */
+    vec3 cloud = mix(uCloudLight, uCloudDark, dens);
+    cloud += vec3(0.05) * smoothstep(0.70, 0.28, f);
+
+    float horizonFade = smoothstep(-0.03, 0.28, dir.y);
+    float amount = clamp(uCloudCover * smoothstep(0.10, 0.58, f + 0.22), 0.0, 1.0) * horizonFade;
+    vec3 col = mix(base, cloud, amount);
+
+    /* clarão do relâmpago difundido pela massa de nuvem */
+    vec3 d2 = normalize(vec3(dir.x, max(dir.y, 0.0), dir.z));
+    float aim = pow(max(dot(d2, uStrikeDir), 0.0), 5.0);
+    col += vec3(0.70, 0.77, 1.0) * uFlash * (0.16 + aim * 1.8) * (0.30 + dens * 0.95);
+
+    return col;
+  }
+`;
+
+/* ═════════════════════════════════════════════
+   5. ÁGUA — ondas de Gerstner
+   Deslocamento horizontal + vertical: cristas
+   agudas e vales largos, como onda real. As
+   normais e o jacobiano (espuma) saem analíticos
+   das derivadas, não de diferenças finitas.
+   ═════════════════════════════════════════════ */
+const CHOPPY = 0.85;
+const WAVES = [
+  { dir: [ 1.00,  0.25], steep: 0.17, len: 34.0 },
+  { dir: [-0.70,  0.70], steep: 0.16, len: 21.0 },
+  { dir: [ 0.30, -0.90], steep: 0.13, len: 13.0 },
+  { dir: [ 0.90,  0.60], steep: 0.10, len:  7.5 },
+  { dir: [-0.40, -0.90], steep: 0.08, len:  4.2 },
+  { dir: [ 0.75, -0.45], steep: 0.06, len:  2.4 },
+];
+
+const waveUniform = WAVES.map(w => {
+  const d = new THREE.Vector2(w.dir[0], w.dir[1]).normalize();
+  return new THREE.Vector4(d.x, d.y, w.steep, w.len);
+});
+
+const waterVS = `
+  #define WAVE_COUNT ${WAVES.length}
+  uniform float uTime;
+  uniform vec4  uWaves[WAVE_COUNT];
+  uniform float uChoppy;
+
+  varying vec3  vWorldPos;
+  varying vec3  vNormal;
+  varying float vFoam;
+  varying float vHeight;
 
   void main(){
-    /* posição de mundo ANTES do deslocamento: mantém a fase das
-       ondas fixa no mundo mesmo com o plano seguindo a câmera */
-    vec3 basePos = (modelMatrix * vec4(position, 1.0)).xyz;
-    float t = uTime * uSeaSpeed;
-    vec2 p = basePos.xz;
+    vec3 base = (modelMatrix * vec4(position, 1.0)).xyz;
+    vec3 p = base;
+    vec3 tangent  = vec3(1.0, 0.0, 0.0);
+    vec3 binormal = vec3(0.0, 0.0, 1.0);
 
-    float h = waveHeightDetailed(p, t);
+    for(int i = 0; i < WAVE_COUNT; i++){
+      vec4 w = uWaves[i];
+      vec2 d = normalize(w.xy);
+      float steep = w.z * uChoppy;
+      float k = 6.28318530718 / w.w;
+      float c = sqrt(9.81 / k);        // dispersão de águas profundas
+      float a = steep / k;
+      float f = k * (dot(d, base.xz) - c * uTime);
+      float cf = cos(f), sf = sin(f);
 
-    /* normal por diferenças finitas (só ondas grandes: barato) */
-    float eps = 0.75;
-    float h0 = waveHeight(p, t);
-    float hx = waveHeight(p + vec2(eps, 0.0), t);
-    float hz = waveHeight(p + vec2(0.0, eps), t);
-    vNormal = normalize(vec3(-(hx-h0)/eps, 1.0, -(hz-h0)/eps));
+      p += vec3(d.x * a * cf, a * sf, d.y * a * cf);
 
-    vWave = h;
-    vec3 pos = position;
-    pos.y += h;
-    vWorldPos = (modelMatrix * vec4(pos, 1.0)).xyz;
-    gl_Position = projectionMatrix * viewMatrix * vec4(vWorldPos, 1.0);
+      tangent  += vec3(-d.x * d.x * steep * sf,  d.x * steep * cf, -d.x * d.y * steep * sf);
+      binormal += vec3(-d.x * d.y * steep * sf,  d.y * steep * cf, -d.y * d.y * steep * sf);
+    }
+
+    vNormal = normalize(cross(binormal, tangent));
+
+    /* jacobiano < 1 => superfície comprimida => espuma de quebra */
+    float J = tangent.x * binormal.z - tangent.z * binormal.x;
+    vFoam = smoothstep(0.92, 0.35, J);
+
+    vHeight   = p.y - base.y;
+    vWorldPos = p;
+    gl_Position = projectionMatrix * viewMatrix * vec4(p, 1.0);
   }
 `;
 
-const waterFragmentShader = `
+const waterFS = `
   uniform float uTime;
-  uniform float uSeaSpeed;
-  uniform vec3 uDeepColor;
-  uniform vec3 uShallowColor;
-  uniform vec3 uCrestColor;
-  uniform vec3 uSkyZenith;
-  uniform vec3 uSkyHorizon;
-  uniform vec3 uFogColor;
+  uniform vec3  uDeep;
+  uniform vec3  uShallow;
+  uniform vec3  uScatter;
+  uniform vec3  uWallColor;
+  uniform vec3  uFogColor;
   uniform float uFogDensity;
-  varying vec3 vWorldPos;
-  varying float vWave;
-  varying vec3 vNormal;
+  uniform float uRainIntensity;
+  ${SKY_UNIFORMS_GLSL}
 
-  /* Ondulação fina analítica: soma de senos direcionais.
-     Retorna o gradiente (dh/dx, dh/dz) — vira normal. */
-  vec2 rippleGradient(vec2 p, float t){
+  varying vec3  vWorldPos;
+  varying vec3  vNormal;
+  varying float vFoam;
+  varying float vHeight;
+
+  ${NOISE_GLSL}
+  ${SKY_GLSL}
+
+  /* marulho fino de vento — abaixo do tamanho do triângulo */
+  vec2 windChopGrad(vec2 p, float t){
     vec2 g = vec2(0.0);
-    vec2 d1 = normalize(vec2( 0.80, 0.60)); float f1 = 1.7; float a1 = 0.022;
-    vec2 d2 = normalize(vec2(-0.50, 0.87)); float f2 = 2.6; float a2 = 0.014;
-    vec2 d3 = normalize(vec2( 0.95,-0.31)); float f3 = 4.1; float a3 = 0.009;
-    vec2 d4 = normalize(vec2(-0.20,-0.98)); float f4 = 6.3; float a4 = 0.005;
-    g += d1 * (a1*f1) * cos(dot(p,d1)*f1 + t*2.2);
-    g += d2 * (a2*f2) * cos(dot(p,d2)*f2 - t*2.9);
-    g += d3 * (a3*f3) * cos(dot(p,d3)*f3 + t*3.7);
-    g += d4 * (a4*f4) * cos(dot(p,d4)*f4 - t*4.6);
+    vec2 d1 = normalize(vec2( 0.80,  0.60)); float f1 = 1.9; float a1 = 0.018;
+    vec2 d2 = normalize(vec2(-0.50,  0.87)); float f2 = 3.1; float a2 = 0.011;
+    vec2 d3 = normalize(vec2( 0.95, -0.31)); float f3 = 5.3; float a3 = 0.006;
+    vec2 d4 = normalize(vec2(-0.20, -0.98)); float f4 = 8.7; float a4 = 0.004;
+    g += d1 * (a1 * f1) * cos(dot(p, d1) * f1 + t * 2.4);
+    g += d2 * (a2 * f2) * cos(dot(p, d2) * f2 - t * 3.2);
+    g += d3 * (a3 * f3) * cos(dot(p, d3) * f3 + t * 4.1);
+    g += d4 * (a4 * f4) * cos(dot(p, d4) * f4 - t * 5.4);
     return g;
   }
 
+  /* ruído fractal derivado: quebra a coerência dos senos,
+     sem ele a superfície vira listras paralelas e manchas chapadas */
+  vec2 fbmGrad(vec2 p, float t, float scale, float speed){
+    float e = 0.35 / scale;
+    vec2 q = p * scale + vec2(t * speed, -t * speed * 0.7);
+    float h0 = fbm3(q);
+    float hx = fbm3(q + vec2(e, 0.0));
+    float hy = fbm3(q + vec2(0.0, e));
+    return vec2(hx - h0, hy - h0) * scale / e;
+  }
+
+  /* anéis de gota: cada célula solta um anel que expande e some */
+  vec2 rainRingGrad(vec2 p, float t){
+    vec2 g = vec2(0.0);
+    vec2 sp = p * 0.9;
+    vec2 ip = floor(sp);
+    vec2 fp = fract(sp);
+    for(int y = -1; y <= 1; y++){
+      for(int x = -1; x <= 1; x++){
+        vec2 o = vec2(float(x), float(y));
+        vec2 rnd = hash22(ip + o);
+        vec2 center = o + rnd;
+        float phase = fract(t * 1.15 + rnd.x * 6.3 + rnd.y * 2.7);
+        vec2 dv = fp - center;
+        float d = length(dv) + 1e-4;
+        float r = phase * 0.62;
+        float amp = (1.0 - phase) * exp(-abs(d - r) * 16.0) * exp(-d * 2.2);
+        g += (dv / d) * cos((d - r) * 46.0) * amp;
+      }
+    }
+    return g * 0.075;
+  }
+
   void main(){
-    vec3 viewDir = normalize(cameraPosition - vWorldPos);
-    float dist = length(vWorldPos - cameraPosition);
-    float t = uTime * uSeaSpeed;
+    vec3  V    = normalize(cameraPosition - vWorldPos);
+    float dist = length(cameraPosition - vWorldPos);
+    vec3  N    = normalize(vNormal);
 
-    /* detalhe some com a distância para não serrilhar */
-    float detailFade = exp(-dist * 0.022);
-    vec2 g = rippleGradient(vWorldPos.xz, t) * (0.35 + 3.0 * detailFade);
-    vec3 n = normalize(vNormal + vec3(-g.x, 0.0, -g.y));
+    /* LOD de normal: detalhe some com a distância (anti-aliasing) */
+    float detail = exp(-dist * 0.018);
+    vec2 g = windChopGrad(vWorldPos.xz, uTime) * (0.22 + 2.4 * detail);
+    g += fbmGrad(vWorldPos.xz, uTime, 0.55, 0.25) * (0.05 + 0.22 * detail);
+    g += fbmGrad(vWorldPos.xz, uTime, 2.10, 0.55) * (0.02 + 0.09 * detail);
+    if(dist < 75.0){
+      g += rainRingGrad(vWorldPos.xz, uTime) * uRainIntensity * detail;
+    }
+    N = normalize(N + vec3(-g.x, 0.0, -g.y));
+    N = normalize(mix(N, vec3(0.0, 1.0, 0.0), smoothstep(70.0, 280.0, dist) * 0.7));
 
-    /* corpo d'água */
-    float mixFactor = smoothstep(-0.45, 0.5, vWave);
-    vec3 body = mix(uDeepColor, uShallowColor, mixFactor);
+    /* reflexo do céu nublado */
+    vec3 R = reflect(-V, N);
+    R.y = max(R.y, 0.012);
+    vec3 refl = skyColor(R, uTime, true);
 
-    /* reflexo do céu — é isso que dá o prateado da referência */
-    vec3 R = reflect(-viewDir, n);
-    float sy = clamp(R.y * 0.5 + 0.5, 0.0, 1.0);
-    vec3 skyRefl = mix(uSkyHorizon, uSkyZenith, pow(sy, 0.45));
+    /* aproximação das torres escuras refletidas junto às margens */
+    float grazing = pow(1.0 - abs(R.y), 3.0);
+    float nearWall = smoothstep(10.0, 26.0, abs(vWorldPos.x));
+    refl = mix(refl, uWallColor, nearWall * grazing * 0.40);
 
-    float fresnel = 0.02 + 0.98 * pow(1.0 - max(dot(viewDir, n), 0.0), 5.0);
-    vec3 color = mix(body, skyRefl, clamp(fresnel * 1.25, 0.0, 1.0));
+    float F = 0.03 + 0.97 * pow(1.0 - max(dot(V, N), 0.0), 5.0);
 
-    /* cristas: água mais clara no alto da onda */
-    float crest = smoothstep(0.28, 0.62, vWave);
-    color = mix(color, uCrestColor, crest * 0.35);
+    /* corpo: vale escuro, crista clara */
+    float hN = clamp(vHeight * 0.55 + 0.5, 0.0, 1.0);
+    vec3 body = mix(uDeep, uShallow, hN);
 
-    /* dois lóbulos especulares: largo (céu difuso) + agudo (glint) */
-    vec3 sunDir = normalize(vec3(0.28, 0.75, 0.60));
-    vec3 halfDir = normalize(sunDir + viewDir);
-    float ndh = max(dot(n, halfDir), 0.0);
-    float specBroad = pow(ndh, 24.0)  * 0.22;
-    float specSharp = pow(ndh, 320.0) * 0.85 * detailFade;
-    color += vec3(1.0, 0.99, 0.96) * (specBroad + specSharp);
+    /* irradiância do domo encoberto: faces viradas para cima recebem mais */
+    vec3 irradiance = mix(uHorizon, uZenith, 0.45);
+    body *= (0.42 + 0.72 * max(N.y, 0.0)) * (0.55 + irradiance);
 
-    /* espuma nas cristas mais inclinadas */
-    float slope = 1.0 - n.y;
-    float foam = smoothstep(0.35, 0.75, vWave) * smoothstep(0.015, 0.10, slope);
-    color = mix(color, vec3(0.92, 0.96, 0.96), foam * 0.30);
+    /* dispersão subsuperficial: luz difusa passando pela crista */
+    vec3 L = normalize(vec3(0.25, 0.72, 0.55));
+    float sss = pow(max(dot(V, -L) * 0.5 + 0.5, 0.0), 3.0) * clamp(vHeight * 0.8, 0.0, 1.0);
+    body += uScatter * sss * 0.5;
 
-    /* mesma fórmula do FogExp2 da cena */
-    float fogFactor = 1.0 - exp(-uFogDensity * uFogDensity * dist * dist);
-    color = mix(color, uFogColor, clamp(fogFactor, 0.0, 1.0));
+    vec3 color = mix(body, refl, clamp(F * 1.30, 0.0, 1.0));
+
+    /* especular GGX: duas fontes largas simulam a claraboia encoberta */
+    float rough = mix(0.045, 0.20, smoothstep(0.0, 100.0, dist));
+    float a2 = rough * rough * rough * rough;
+    vec3 spec = vec3(0.0);
+    for(int i = 0; i < 2; i++){
+      vec3 Li = i == 0 ? L : normalize(vec3(-0.45, 0.80, -0.30));
+      vec3 H = normalize(Li + V);
+      float ndh = max(dot(N, H), 0.0);
+      float den = ndh * ndh * (a2 - 1.0) + 1.0;
+      spec += vec3(1.0, 0.99, 0.96) * min(a2 / (3.14159265 * den * den) * 0.10, 6.0) * (i == 0 ? 1.0 : 0.55);
+    }
+    color += spec * (0.6 + uFlash * 5.0);
+
+    /* espuma: jacobiano modulado por textura para não ficar chapada */
+    float foamTex = fbm3(vWorldPos.xz * 0.6 + uTime * 0.06);
+    float foam = clamp(vFoam * (0.25 + foamTex * 1.35), 0.0, 1.0);
+    foam *= 0.35 + 0.65 * smoothstep(-0.2, 0.6, vHeight);
+    color = mix(color, vec3(0.88, 0.93, 0.94), foam * 0.9);
+
+    /* superfície acesa pelo relâmpago */
+    color += vec3(0.50, 0.58, 0.78) * uFlash * 0.22;
+
+    float fogF = 1.0 - exp(-uFogDensity * uFogDensity * dist * dist);
+    vec3 fogLit = uFogColor + vec3(0.55, 0.62, 0.82) * uFlash * 0.40;
+    color = mix(color, fogLit, clamp(fogF, 0.0, 1.0));
 
     gl_FragColor = vec4(color, 1.0);
   }
 `;
 
-/* Plano menor porém MUITO mais denso: a névoa esconde a borda,
-   e a resolução perto da câmera é o que importa. */
 const waterGeo = new THREE.PlaneGeometry(520, 520, 384, 384);
 waterGeo.rotateX(-Math.PI / 2);
 
 const waterMat = new THREE.ShaderMaterial({
-  uniforms: {
-    uTime:         { value: 0 },
-    uSeaSpeed:     { value: 1.0 },
-    uDeepColor:    { value: WATER_DEEP },
-    uShallowColor: { value: WATER_SHALLOW },
-    uCrestColor:   { value: WATER_CREST },
-    uSkyZenith:    { value: SKY_ZENITH },
-    uSkyHorizon:   { value: SKY_HORIZON },
-    uFogColor:     { value: FOG_COLOR },
-    uFogDensity:   { value: FOG_DENSITY },
-  },
-  vertexShader: waterVertexShader,
-  fragmentShader: waterFragmentShader,
+  uniforms: Object.assign({}, U, {
+    uWaves:         { value: waveUniform },
+    uChoppy:        { value: CHOPPY },
+    uDeep:          { value: WATER_DEEP },
+    uShallow:       { value: WATER_SHALLOW },
+    uScatter:       { value: WATER_SCATTER },
+    uWallColor:     { value: WALL_COLOR },
+    uRainIntensity: { value: 1.0 },
+  }),
+  vertexShader: waterVS,
+  fragmentShader: waterFS,
 });
 
 const water = new THREE.Mesh(waterGeo, waterMat);
-water.position.y = -0.1;
 water.frustumCulled = false;
 scene.add(water);
 
-/* ─────────────────────────────────────────────
-   4. MATERIAIS COMPARTILHADOS
-   Um material por tipo => as torres inteiras
-   viram 2 draw calls (pedra + janelas).
-   ───────────────────────────────────────────── */
-const STONE_MAT = new THREE.MeshStandardMaterial({
-  vertexColors: true,
-  roughness: 0.95,
-  metalness: 0.02,
-});
+/* mesma soma de Gerstner em JS, para a câmera boiar */
+function surfaceHeight(x, z, t) {
+  let y = 0;
+  for (const w of WAVES) {
+    const len = Math.hypot(w.dir[0], w.dir[1]);
+    const dx = w.dir[0] / len, dz = w.dir[1] / len;
+    const k = (Math.PI * 2) / w.len;
+    const c = Math.sqrt(9.81 / k);
+    const a = (w.steep * CHOPPY) / k;
+    y += a * Math.sin(k * (dx * x + dz * z - c * t));
+  }
+  return y;
+}
 
-const WINDOW_MAT = new THREE.MeshBasicMaterial({
-  vertexColors: true,
-  side: THREE.DoubleSide,
-  toneMapped: false, // mantém o âmbar saturado depois do ACES
-});
+/* ═════════════════════════════════════════════
+   6. CÉU NUBLADO
+   ═════════════════════════════════════════════ */
+const skyVS = `
+  varying vec3 vDir;
+  void main(){
+    vDir = position;
+    vec4 pos = projectionMatrix * mat4(mat3(viewMatrix)) * vec4(position, 1.0);
+    gl_Position = pos.xyww;
+  }
+`;
 
-const FOAM_MAT = new THREE.MeshBasicMaterial({
-  color: 0xeef3f4,
+const skyFS = `
+  uniform float uTime;
+  ${SKY_UNIFORMS_GLSL}
+  varying vec3 vDir;
+  ${NOISE_GLSL}
+  ${SKY_GLSL}
+  void main(){
+    gl_FragColor = vec4(skyColor(normalize(vDir), uTime, false), 1.0);
+  }
+`;
+
+const sky = new THREE.Mesh(
+  new THREE.SphereGeometry(500, 32, 16),
+  new THREE.ShaderMaterial({
+    uniforms: Object.assign({}, U),
+    vertexShader: skyVS,
+    fragmentShader: skyFS,
+    side: THREE.BackSide,
+    depthWrite: false,
+  })
+);
+sky.frustumCulled = false;
+sky.renderOrder = -1;
+scene.add(sky);
+
+/* ═════════════════════════════════════════════
+   7. CHUVA — quads instanciados na GPU
+   Cada gota é um quad alinhado ao vetor
+   velocidade (rastro de motion blur), com núcleo
+   claro e cauda que some. Posição é integrada no
+   shader e embrulhada em torno da câmera, então
+   nada é atualizado pela CPU.
+   ═════════════════════════════════════════════ */
+const rainVS = `
+  uniform float uTime;
+  uniform vec3  uCamPos;
+  uniform vec2  uWind;
+  uniform vec3  uBox;
+  uniform float uWidth;
+
+  attribute vec3  aOrigin;
+  attribute float aSpeed;
+  attribute float aLength;
+  attribute float aOpacity;
+
+  varying vec2  vUv;
+  varying float vAlpha;
+  varying float vDist;
+
+  void main(){
+    vec3 p = aOrigin;
+    p.y -= aSpeed * uTime;
+    p.xz += uWind * uTime * aSpeed * 0.05;
+
+    /* caixa de chuva embrulhada em torno da câmera */
+    vec3 h = uBox * 0.5;
+    p.x = mod(p.x - uCamPos.x + h.x, uBox.x) - h.x + uCamPos.x;
+    p.z = mod(p.z - uCamPos.z + h.z, uBox.z) - h.z + uCamPos.z;
+    p.y = mod(p.y, uBox.y);
+
+    vec3 vel   = normalize(vec3(uWind.x * 0.05, -1.0, uWind.y * 0.05));
+    vec3 toCam = uCamPos - p;
+    float d    = length(toCam);
+    vec3 vdir  = toCam / max(d, 1e-4);
+
+    vec3 side = cross(vel, vdir);
+    float sl  = length(side);
+    side = sl > 1e-4 ? side / sl : vec3(1.0, 0.0, 0.0);
+
+    /* rastro mais longo quanto mais rápida a gota */
+    float len = aLength * (0.7 + aSpeed * 0.02);
+    vec3 wp = p + side * (position.x * uWidth) - vel * (position.y * len);
+
+    vUv   = vec2(position.x + 0.5, position.y);
+    vDist = d;
+
+    float nearFade = smoothstep(0.5, 3.5, d);
+    float farFade  = 1.0 - smoothstep(uBox.x * 0.26, uBox.x * 0.5, d);
+    vAlpha = aOpacity * nearFade * farFade;
+
+    gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
+  }
+`;
+
+const rainFS = `
+  uniform vec3  uRainColor;
+  uniform vec3  uFogColor;
+  uniform float uFogDensity;
+  uniform float uFlash;
+
+  varying vec2  vUv;
+  varying float vAlpha;
+  varying float vDist;
+
+  void main(){
+    /* seção transversal suave: sem borda dura de linha */
+    float section = 1.0 - abs(vUv.x * 2.0 - 1.0);
+    section = pow(section, 1.5);
+
+    /* cabeça brilhante, cauda que dissolve */
+    float head  = smoothstep(0.0, 0.12, vUv.y);
+    float tail  = pow(1.0 - vUv.y, 0.85);
+    float along = mix(0.35, 1.0, head) * tail;
+
+    float a = vAlpha * section * along;
+    if(a < 0.004) discard;
+
+    vec3 col = uRainColor * (1.0 + uFlash * 2.6);
+
+    float fogF = 1.0 - exp(-uFogDensity * uFogDensity * vDist * vDist);
+    col = mix(col, uFogColor, fogF * 0.85);
+    a  *= (1.0 - fogF * 0.7);
+
+    gl_FragColor = vec4(col, a);
+  }
+`;
+
+function createRainLayer(opts) {
+  const { count, box, width, speed, length, opacity, color } = opts;
+
+  const geo = new THREE.InstancedBufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(
+    [-0.5, 0, 0,  0.5, 0, 0,  0.5, 1, 0,  -0.5, 1, 0], 3));
+  geo.setIndex([0, 1, 2, 0, 2, 3]);
+
+  const origins   = new Float32Array(count * 3);
+  const speeds    = new Float32Array(count);
+  const lengths   = new Float32Array(count);
+  const opacities = new Float32Array(count);
+
+  for (let i = 0; i < count; i++) {
+    origins[i * 3]     = (Math.random() - 0.5) * box.x;
+    origins[i * 3 + 1] = Math.random() * box.y;
+    origins[i * 3 + 2] = (Math.random() - 0.5) * box.z;
+    speeds[i]    = speed[0] + Math.random() * (speed[1] - speed[0]);
+    lengths[i]   = length[0] + Math.random() * (length[1] - length[0]);
+    opacities[i] = opacity * (0.55 + Math.random() * 0.75);
+  }
+
+  geo.setAttribute('aOrigin',  new THREE.InstancedBufferAttribute(origins, 3));
+  geo.setAttribute('aSpeed',   new THREE.InstancedBufferAttribute(speeds, 1));
+  geo.setAttribute('aLength',  new THREE.InstancedBufferAttribute(lengths, 1));
+  geo.setAttribute('aOpacity', new THREE.InstancedBufferAttribute(opacities, 1));
+  geo.instanceCount = count;
+
+  const mat = new THREE.ShaderMaterial({
+    uniforms: Object.assign({}, U, {
+      uCamPos:    { value: new THREE.Vector3() },
+      uWind:      { value: new THREE.Vector2(3.0, 0.6) },
+      uBox:       { value: new THREE.Vector3(box.x, box.y, box.z) },
+      uWidth:     { value: width },
+      uRainColor: { value: new THREE.Color(color) },
+    }),
+    vertexShader: rainVS,
+    fragmentShader: rainFS,
+    transparent: true,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.frustumCulled = false;
+  mesh.renderOrder = 10;
+  scene.add(mesh);
+  return mesh;
+}
+
+/* três camadas: perto (poucas, longas, nítidas),
+   médio, e um véu distante quase sem contraste */
+const rainLayers = [
+  createRainLayer({ count: 5000,  box: { x: 46,  y: 40, z: 46  }, width: 0.026,
+                    speed: [16, 24], length: [0.8, 1.7], opacity: 0.34, color: 0xf0f5f9 }),
+  createRainLayer({ count: 12000, box: { x: 120, y: 65, z: 120 }, width: 0.055,
+                    speed: [20, 28], length: [1.4, 2.9], opacity: 0.20, color: 0xe6ecf2 }),
+  createRainLayer({ count: 16000, box: { x: 260, y: 95, z: 260 }, width: 0.120,
+                    speed: [22, 32], length: [2.2, 4.4], opacity: 0.11, color: 0xdae1e8 }),
+];
+
+/* ═════════════════════════════════════════════
+   8. TEMPESTADE — clarão, raio e trovão
+   ═════════════════════════════════════════════ */
+const boltGroup = new THREE.Group();
+boltGroup.frustumCulled = false;
+scene.add(boltGroup);
+
+const boltMat = new THREE.LineBasicMaterial({
+  color: 0xe6edff,
   transparent: true,
-  opacity: 0.9,
-});
-const FOAM_SOFT_MAT = new THREE.MeshBasicMaterial({
-  color: 0xdfe8ea,
-  transparent: true,
-  opacity: 0.35,
+  opacity: 0,
+  fog: false,
+  blending: THREE.AdditiveBlending,
   depthWrite: false,
 });
 
-const C_BODY   = new THREE.Color(0x2f333b);
-const C_SPIRE  = new THREE.Color(0x24272e);
-const C_BAND   = new THREE.Color(0x272a31);
-const C_ROOF   = new THREE.Color(0x2a2d34);
-const C_OFF    = new THREE.Color(0x0e1013); // janela apagada
+function spawnBolt(azimuth, camPos) {
+  const dist = 130 + Math.random() * 130;
+  const pts = [];
+  let x = camPos.x + Math.cos(azimuth) * dist;
+  let z = camPos.z + Math.sin(azimuth) * dist;
+  let y = 145;
+  const segs = 24;
+  const spine = [];
+  for (let i = 0; i <= segs; i++) {
+    spine.push(new THREE.Vector3(x, y, z));
+    y -= 145 / segs;
+    x += (Math.random() - 0.5) * 11;
+    z += (Math.random() - 0.5) * 11;
+  }
+  for (let i = 0; i < spine.length - 1; i++) pts.push(spine[i], spine[i + 1]);
 
-/* ─────────────────────────────────────────────
-   5. HELPERS DE GEOMETRIA
-   ───────────────────────────────────────────── */
+  /* ramificações */
+  const branches = 2 + Math.floor(Math.random() * 3);
+  for (let b = 0; b < branches; b++) {
+    const i = 3 + Math.floor(Math.random() * (spine.length - 8));
+    let p = spine[i].clone();
+    const dir = new THREE.Vector3((Math.random() - 0.5) * 1.8, -1, (Math.random() - 0.5) * 1.8).normalize();
+    const steps = 3 + Math.floor(Math.random() * 4);
+    for (let s = 0; s < steps; s++) {
+      const q = p.clone().addScaledVector(dir, 7 + Math.random() * 12);
+      q.x += (Math.random() - 0.5) * 7;
+      q.z += (Math.random() - 0.5) * 7;
+      pts.push(p.clone(), q.clone());
+      p = q;
+    }
+  }
+
+  const line = new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(pts), boltMat);
+  line.frustumCulled = false;
+  line.userData.life = 0.32 + Math.random() * 0.2;
+  line.userData.age = 0;
+  boltGroup.add(line);
+}
+
+const storm = {
+  pulses: [],
+  nextStrike: 2.5 + Math.random() * 5,
+  timer: 0,
+  flash: 0,
+};
+
+function triggerStrike(camPos) {
+  const distance = 220 + Math.random() * 3200;              // metros
+  const closeness = THREE.MathUtils.clamp(1 - distance / 3400, 0, 1);
+  const amp = 0.28 + closeness * 1.0;
+
+  const az = Math.random() * Math.PI * 2;
+  U.uStrikeDir.value.set(Math.cos(az) * 0.62, 0.5, Math.sin(az) * 0.62).normalize();
+
+  /* perfil de descarga: golpe principal + retornos */
+  storm.pulses.length = 0;
+  const n = 2 + Math.floor(Math.random() * 4);
+  let offset = 0;
+  for (let i = 0; i < n; i++) {
+    storm.pulses.push({
+      t: offset,
+      a: amp * (i === 0 ? 1.0 : 0.3 + Math.random() * 0.65),
+      tau: 0.045 + Math.random() * 0.10,
+    });
+    offset += 0.035 + Math.random() * 0.14;
+  }
+  storm.timer = 0;
+
+  flashLight.position.set(
+    camPos.x + Math.cos(az) * 160, 130, camPos.z + Math.sin(az) * 160
+  );
+  flashLight.target.position.set(camPos.x, 0, camPos.z);
+  flashLight.target.updateMatrixWorld();
+
+  if (closeness > 0.42) spawnBolt(az, camPos);
+  playThunder(distance / 343, closeness);
+
+  storm.nextStrike = 2.0 + Math.random() * 9.0;
+}
+
+function updateStorm(dt, camPos) {
+  storm.timer += dt;
+
+  if (storm.pulses.length === 0 && storm.timer > storm.nextStrike) {
+    triggerStrike(camPos);
+  }
+
+  let f = 0;
+  let alive = false;
+  for (const p of storm.pulses) {
+    const age = storm.timer - p.t;
+    if (age < 0) { alive = true; continue; }
+    const v = p.a * Math.exp(-age / p.tau);
+    if (v > 0.002) alive = true;
+    f += v;
+  }
+  if (!alive) storm.pulses.length = 0;
+
+  storm.flash = Math.min(f, 1.25);
+  U.uFlash.value = storm.flash;
+
+  flashLight.intensity = storm.flash * 5.0;
+  flashAmbient.intensity = storm.flash * 1.1;
+
+  /* raios visíveis somem junto com o clarão */
+  for (let i = boltGroup.children.length - 1; i >= 0; i--) {
+    const b = boltGroup.children[i];
+    b.userData.age += dt;
+    if (b.userData.age > b.userData.life) {
+      boltGroup.remove(b);
+      b.geometry.dispose();
+    }
+  }
+  boltMat.opacity = Math.min(storm.flash * 0.9, 0.95);
+}
+
+/* ── Áudio: trovão sintetizado + leito de chuva ── */
+let audioCtx = null;
+let rainBed = null;
+
+function ensureAudio() {
+  if (!audioCtx) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    audioCtx = new Ctx();
+    startRainBed();
+    const hint = document.getElementById('audioHint');
+    if (hint) hint.textContent = 'som ativo';
+  }
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+}
+window.addEventListener('pointerdown', ensureAudio);
+window.addEventListener('keydown', ensureAudio);
+
+function noiseBuffer(seconds, brown) {
+  const sr = audioCtx.sampleRate;
+  const buf = audioCtx.createBuffer(1, Math.floor(sr * seconds), sr);
+  const d = buf.getChannelData(0);
+  let last = 0;
+  for (let i = 0; i < d.length; i++) {
+    const w = Math.random() * 2 - 1;
+    if (brown) { last = (last + 0.022 * w) / 1.022; d[i] = last * 3.4; }
+    else d[i] = w;
+  }
+  return buf;
+}
+
+function startRainBed() {
+  const src = audioCtx.createBufferSource();
+  src.buffer = noiseBuffer(4, false);
+  src.loop = true;
+
+  const hp = audioCtx.createBiquadFilter();
+  hp.type = 'highpass'; hp.frequency.value = 700;
+  const lp = audioCtx.createBiquadFilter();
+  lp.type = 'lowpass'; lp.frequency.value = 5200;
+
+  const gain = audioCtx.createGain();
+  gain.gain.value = 0.055;
+
+  src.connect(hp); hp.connect(lp); lp.connect(gain); gain.connect(audioCtx.destination);
+  src.start();
+  rainBed = gain;
+}
+
+function playThunder(delay, closeness) {
+  if (!audioCtx) return;
+  const t0 = audioCtx.currentTime + delay;
+  const dur = 2.6 + closeness * 3.0;
+
+  const buf = noiseBuffer(dur, true);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) {
+    const x = i / d.length;
+    /* envelope: rolo longo + ondulações; estalo só se for perto */
+    let env = Math.exp(-x * 2.1) * (0.55 + 0.45 * Math.sin(x * 26.0) * Math.exp(-x * 5.0));
+    if (closeness > 0.6) env += Math.exp(-x * 95.0) * (closeness - 0.6) * 3.0;
+    d[i] *= env;
+  }
+
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+
+  const lp = audioCtx.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.setValueAtTime(180 + closeness * 1700, t0);
+  lp.frequency.exponentialRampToValueAtTime(85, t0 + dur);
+
+  const gain = audioCtx.createGain();
+  gain.gain.value = 0.12 + closeness * 0.55;
+
+  src.connect(lp); lp.connect(gain); gain.connect(audioCtx.destination);
+  src.start(t0);
+}
+
+/* ═════════════════════════════════════════════
+   9. MATERIAIS DA CIDADE
+   ═════════════════════════════════════════════ */
+const STONE_MAT = new THREE.MeshStandardMaterial({
+  vertexColors: true, roughness: 0.95, metalness: 0.02,
+});
+const WINDOW_MAT = new THREE.MeshBasicMaterial({
+  vertexColors: true, side: THREE.DoubleSide, toneMapped: false,
+});
+const FOAM_MAT = new THREE.MeshBasicMaterial({
+  color: 0xdde5e7, transparent: true, opacity: 0.7,
+});
+const FOAM_SOFT_MAT = new THREE.MeshBasicMaterial({
+  color: 0xd0dade, transparent: true, opacity: 0.22, depthWrite: false,
+});
+
+/* claras de propósito: o pipeline converte sRGB → linear,
+   então um cinza escuro aqui vira quase preto na tela */
+const C_BODY  = new THREE.Color(0x5c626c);
+const C_SPIRE = new THREE.Color(0x4d535c);
+const C_BAND  = new THREE.Color(0x51575f);
+const C_ROOF  = new THREE.Color(0x555b64);
+const C_OFF   = new THREE.Color(0x0d0f12);
+
+/* ═════════════════════════════════════════════
+   10. HELPERS
+   ═════════════════════════════════════════════ */
 function pushGeo(list, geo, matrix, colorFn) {
   const posAttr = geo.attributes.position;
   const colors = new Float32Array(posAttr.count * 3);
   const c = new THREE.Color();
   for (let i = 0; i < posAttr.count; i++) {
     colorFn(c, posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i));
-    colors[i * 3]     = c.r;
-    colors[i * 3 + 1] = c.g;
-    colors[i * 3 + 2] = c.b;
+    colors[i * 3] = c.r; colors[i * 3 + 1] = c.g; colors[i * 3 + 2] = c.b;
   }
   geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
   geo.applyMatrix4(matrix);
@@ -311,11 +865,8 @@ function pushGeo(list, geo, matrix, colorFn) {
   list.push(nonIndexed);
 }
 
-function flat(color) {
-  return (c) => c.copy(color);
-}
+const flat = (color) => (c) => c.copy(color);
 
-/* PRNG determinístico: o mesmo chunk sempre gera a mesma cidade */
 function mulberry32(seed) {
   let a = seed >>> 0;
   return function () {
@@ -326,18 +877,13 @@ function mulberry32(seed) {
   };
 }
 
-/* ─────────────────────────────────────────────
-   6. TORRE GÓTICA
-   Silhueta da referência: bloco chapado + COROA
-   de várias agulhas finas, não um pináculo só.
-   ───────────────────────────────────────────── */
-
-/* Lanceta: janela alta, estreita, TOPO EM ARCO e MACIÇA
-   (a referência mostra o vão inteiro brilhando, sem moldura) */
+/* ═════════════════════════════════════════════
+   11. TORRE GÓTICA
+   ═════════════════════════════════════════════ */
 function lancetShape(w, h) {
   const shape = new THREE.Shape();
   const hw = w / 2;
-  const shoulder = h - hw; // onde o arco começa
+  const shoulder = h - hw;
   shape.moveTo(-hw, 0);
   shape.lineTo(-hw, shoulder);
   shape.absarc(0, shoulder, hw, Math.PI, 0, false);
@@ -348,12 +894,8 @@ function lancetShape(w, h) {
 
 const WIN_TOP    = new THREE.Color(0xffd9a0);
 const WIN_BOTTOM = new THREE.Color(0xff9a2e);
-
-function windowColorFn(h) {
-  return (c, x, y) => {
-    c.copy(WIN_BOTTOM).lerp(WIN_TOP, THREE.MathUtils.clamp(y / h, 0, 1));
-  };
-}
+const windowColorFn = (h) => (c, x, y) =>
+  c.copy(WIN_BOTTOM).lerp(WIN_TOP, THREE.MathUtils.clamp(y / h, 0, 1));
 
 function buildTower(cfg, rng) {
   const stoneGeos = [];
@@ -363,11 +905,9 @@ function buildTower(cfg, rng) {
   const halfW = width / 2;
   const halfD = depth / 2;
 
-  /* corpo */
   pushGeo(stoneGeos, new THREE.BoxGeometry(width, height, depth),
     m.makeTranslation(0, height / 2, 0), flat(C_BODY));
 
-  /* frisos horizontais */
   const bandCount = Math.max(2, Math.round(height / 9));
   for (let i = 0; i < bandCount; i++) {
     const y = height * (0.18 + (i / bandCount) * 0.72);
@@ -375,15 +915,11 @@ function buildTower(cfg, rng) {
       m.makeTranslation(0, y, 0), flat(C_BAND));
   }
 
-  /* parapeito no topo */
   const parapetH = 0.55;
   pushGeo(stoneGeos, new THREE.BoxGeometry(width * 1.06, parapetH, depth * 1.06),
     m.makeTranslation(0, height + parapetH / 2, 0), flat(C_ROOF));
   const roofY = height + parapetH;
 
-  /* ── COROA DE AGULHAS ──
-     grade nx × nz de cones finos; as do meio são mais altas,
-     exatamente o perfil "serra de espinhos" da imagem */
   if (cfg.style !== 'slab') {
     const nx = cfg.spireCols;
     const nz = depth > 7.5 ? 2 : 1;
@@ -395,23 +931,17 @@ function buildTower(cfg, rng) {
       for (let iz = 0; iz < nz; iz++) {
         const x = (ix - (nx - 1) / 2) * stepX;
         const z = (iz - (nz - 1) / 2) * stepZ;
-
         const half = Math.max((nx - 1) / 2, 0.001);
-        const centerBias = 1.0 - Math.abs(ix - (nx - 1) / 2) / half; // 1 no centro
+        const centerBias = 1.0 - Math.abs(ix - (nx - 1) / 2) / half;
         const sh = cfg.spireHeight * (0.55 + 0.45 * centerBias) * (0.85 + rng() * 0.3);
 
-        /* pequeno tambor sob a agulha */
         pushGeo(stoneGeos, new THREE.BoxGeometry(radius * 1.7, 0.6, radius * 1.7),
           m.makeTranslation(x, roofY + 0.3, z), flat(C_ROOF));
-
         pushGeo(stoneGeos, new THREE.ConeGeometry(radius, sh, 6),
           m.makeTranslation(x, roofY + 0.6 + sh / 2, z), flat(C_SPIRE));
       }
     }
-  }
 
-  /* ── TORRETAS DE CANTO: finas, altas, com agulha longa ── */
-  if (cfg.style !== 'slab') {
     const tW = Math.min(width, depth) * 0.16;
     const tH = height * (0.92 + rng() * 0.12);
     const tSpire = cfg.spireHeight * 1.05;
@@ -428,9 +958,7 @@ function buildTower(cfg, rng) {
         m.makeTranslation(tx, tH + tSpire / 2, tz), flat(C_SPIRE));
     }
   } else {
-    /* laje chapada: só ameias baixas, como os blocos escuros da imagem */
-    const step = 1.6;
-    const nBattle = Math.max(3, Math.floor(width / step));
+    const nBattle = Math.max(3, Math.floor(width / 1.6));
     const gap = width / nBattle;
     for (let i = 0; i < nBattle; i++) {
       const x = (i - (nBattle - 1) / 2) * gap;
@@ -441,10 +969,7 @@ function buildTower(cfg, rng) {
     }
   }
 
-  /* ── JANELAS ── lancetas densas, algumas apagadas */
-  const winW = 0.26;
-  const winH = 1.15;
-  const rowSpacing = 2.0;
+  const winW = 0.26, winH = 1.15, rowSpacing = 2.0;
   const rows = Math.max(2, Math.floor((height - 2.5) / rowSpacing));
   const cols = cfg.windowCols;
   const colSpacing = (width * 0.62) / Math.max(cols - 1, 1);
@@ -452,34 +977,24 @@ function buildTower(cfg, rng) {
   const offFn = flat(C_OFF);
 
   for (let row = 0; row < rows; row++) {
-    const y = 2.2 + row * rowSpacing;
+    const y = 2.6 + row * rowSpacing;
     if (y > height - 1.2) break;
 
     for (let col = 0; col < cols; col++) {
       const off = (col - (cols - 1) / 2) * colSpacing;
-      const lit = rng() > 0.18;
-      const fn = lit ? colorFn : offFn;
 
-      /* frente / trás */
       pushGeo(winGeos, lancetShape(winW, winH),
-        m.makeTranslation(off, y, halfD + 0.06), fn);
+        m.makeTranslation(off, y, halfD + 0.06), rng() > 0.18 ? colorFn : offFn);
 
-      const back = new THREE.Matrix4()
-        .makeRotationY(Math.PI)
-        .setPosition(off * -1, y, -halfD - 0.06);
+      const back = new THREE.Matrix4().makeRotationY(Math.PI).setPosition(-off, y, -halfD - 0.06);
       pushGeo(winGeos, lancetShape(winW, winH), back, rng() > 0.18 ? colorFn : offFn);
 
-      /* laterais (torres largas) */
       if (width > 6) {
         const zOff = off * (depth / width);
-        const right = new THREE.Matrix4()
-          .makeRotationY(Math.PI / 2)
-          .setPosition(halfW + 0.06, y, zOff * -1);
+        const right = new THREE.Matrix4().makeRotationY(Math.PI / 2).setPosition(halfW + 0.06, y, -zOff);
         pushGeo(winGeos, lancetShape(winW * 0.9, winH * 0.9), right, rng() > 0.22 ? colorFn : offFn);
 
-        const left = new THREE.Matrix4()
-          .makeRotationY(-Math.PI / 2)
-          .setPosition(-halfW - 0.06, y, zOff);
+        const left = new THREE.Matrix4().makeRotationY(-Math.PI / 2).setPosition(-halfW - 0.06, y, zOff);
         pushGeo(winGeos, lancetShape(winW * 0.9, winH * 0.9), left, rng() > 0.22 ? colorFn : offFn);
       }
     }
@@ -491,14 +1006,10 @@ function buildTower(cfg, rng) {
   return group;
 }
 
-/* ─────────────────────────────────────────────
-   7. ESPUMA NA BASE
-   Colar branco onde a parede corta a água.
-   ───────────────────────────────────────────── */
+/* colar de espuma alto o bastante para as ondas
+   maiores não abrirem fresta na base da parede */
 function createFoamCollar(width, depth) {
   const g = new THREE.Group();
-  const halfW = width / 2;
-  const halfD = depth / 2;
 
   const ring = (w, d, thick, h, mat, y) => {
     const lr = new THREE.BoxGeometry(thick, h, d + thick);
@@ -509,126 +1020,35 @@ function createFoamCollar(width, depth) {
       [new THREE.Mesh(fb, mat), 0, y, -d / 2],
       [new THREE.Mesh(fb, mat), 0, y,  d / 2],
     ];
-    for (const [mesh, x, my, z] of parts) {
-      mesh.position.set(x, my, z);
-      g.add(mesh);
-    }
+    for (const [mesh, x, my, z] of parts) { mesh.position.set(x, my, z); g.add(mesh); }
   };
 
-  ring(width, depth, 0.55, 0.75, FOAM_MAT, 0.0);        // colar duro
-  ring(width + 1.4, depth + 1.4, 1.2, 0.45, FOAM_SOFT_MAT, 0.05); // respingo difuso
+  ring(width, depth, 0.35, 1.3, FOAM_MAT, -0.35);
+  ring(width + 1.0, depth + 1.0, 0.85, 0.8, FOAM_SOFT_MAT, -0.30);
   return g;
 }
 
-/* ─────────────────────────────────────────────
-   8. CHUVA
-   ───────────────────────────────────────────── */
-const RAIN_COUNT = 6000;
-const RAIN_SPREAD = 110;
-const RAIN_SLANT = 0.28;
-
-function createRainSystem(count) {
-  const positions = new Float32Array(count * 6);
-  const colors = new Float32Array(count * 6);
-  const velocities = new Float32Array(count);
-  const head = new THREE.Color(0xe8eef2);
-  const tail = new THREE.Color(0x9fa8ae);
-
-  for (let i = 0; i < count; i++) {
-    const i6 = i * 6;
-    const len = 2.0 + Math.random() * 3.0;
-    positions[i6]     = (Math.random() - 0.5) * RAIN_SPREAD * 2;
-    positions[i6 + 1] = Math.random() * 110;
-    positions[i6 + 2] = (Math.random() - 0.5) * RAIN_SPREAD * 2;
-    positions[i6 + 3] = positions[i6] - RAIN_SLANT * len;
-    positions[i6 + 4] = positions[i6 + 1] - len;
-    positions[i6 + 5] = positions[i6 + 2] - RAIN_SLANT * len * 0.5;
-
-    colors[i6]     = head.r; colors[i6 + 1] = head.g; colors[i6 + 2] = head.b;
-    colors[i6 + 3] = tail.r; colors[i6 + 4] = tail.g; colors[i6 + 5] = tail.b;
-
-    velocities[i] = 22 + Math.random() * 20;
-  }
-
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-
-  const material = new THREE.LineBasicMaterial({
-    vertexColors: true,
-    transparent: true,
-    opacity: 0.5,
-    depthWrite: false,
-  });
-
-  const lines = new THREE.LineSegments(geometry, material);
-  lines.frustumCulled = false;
-  return { mesh: lines, velocities, count };
-}
-
-/* ─────────────────────────────────────────────
-   9. CÉU
-   ───────────────────────────────────────────── */
-const skyVS = `
-  varying vec3 vDir;
-  void main(){
-    vDir = position;
-    vec4 pos = projectionMatrix * mat4(mat3(viewMatrix)) * vec4(position, 1.0);
-    gl_Position = pos.xyww;
-  }
-`;
-
-const skyFS = `
-  uniform vec3 uTopColor;
-  uniform vec3 uBottomColor;
-  varying vec3 vDir;
-  void main(){
-    float h = normalize(vDir).y * 0.5 + 0.5;
-    vec3 sky = mix(uBottomColor, uTopColor, pow(h, 0.7));
-    gl_FragColor = vec4(sky, 1.0);
-  }
-`;
-
-const sky = new THREE.Mesh(
-  new THREE.SphereGeometry(500, 32, 16),
-  new THREE.ShaderMaterial({
-    uniforms: {
-      uTopColor:    { value: SKY_ZENITH },
-      uBottomColor: { value: SKY_HORIZON },
-    },
-    vertexShader: skyVS,
-    fragmentShader: skyFS,
-    side: THREE.BackSide,
-    depthWrite: false,
-  })
-);
-sky.frustumCulled = false; // o vértice ignora translação; nunca deve ser cortado
-sky.renderOrder = -1;
-scene.add(sky);
-
-/* ─────────────────────────────────────────────
-   10. GERAÇÃO DA CIDADE
-   Prédios nascem direto da borda do canal e em
-   duas camadas, criando a profundidade da imagem.
-   ───────────────────────────────────────────── */
-const CHANNEL_WIDTH   = 26;
-const TOWER_SPACING_Z = 15;
-const BACK_ROW_OFFSET = 15;
-const CHUNK_SIZE      = 180;
-const CHUNKS_AHEAD    = 4;
-const CHUNKS_BEHIND   = 1;
+/* ═════════════════════════════════════════════
+   12. GERAÇÃO DA CIDADE
+   ═════════════════════════════════════════════ */
+const CHANNEL_WIDTH    = 26;
+const TOWER_SPACING_Z  = 15;
+const BACK_ROW_OFFSET  = 15;
+const CHUNK_SIZE       = 180;
+const CHUNKS_AHEAD     = 4;
+const CHUNKS_BEHIND    = 1;
 const TOWERS_PER_CHUNK = Math.round(CHUNK_SIZE / TOWER_SPACING_Z);
 
 const towerConfigs = [
-  { width: 7.0, depth: 7.0, height: 22, spireHeight: 9,  spireCols: 3, windowCols: 3, style: 'spired' },
-  { width: 5.5, depth: 5.5, height: 17, spireHeight: 7,  spireCols: 3, windowCols: 2, style: 'spired' },
-  { width: 9.0, depth: 8.0, height: 30, spireHeight: 12, spireCols: 4, windowCols: 4, style: 'spired' },
-  { width: 6.0, depth: 6.0, height: 14, spireHeight: 6,  spireCols: 3, windowCols: 2, style: 'spired' },
-  { width: 8.0, depth: 7.5, height: 26, spireHeight: 11, spireCols: 4, windowCols: 3, style: 'spired' },
-  { width: 4.5, depth: 4.5, height: 12, spireHeight: 5,  spireCols: 2, windowCols: 2, style: 'spired' },
+  { width: 7.0,  depth: 7.0, height: 22, spireHeight: 9,  spireCols: 3, windowCols: 3, style: 'spired' },
+  { width: 5.5,  depth: 5.5, height: 17, spireHeight: 7,  spireCols: 3, windowCols: 2, style: 'spired' },
+  { width: 9.0,  depth: 8.0, height: 30, spireHeight: 12, spireCols: 4, windowCols: 4, style: 'spired' },
+  { width: 6.0,  depth: 6.0, height: 14, spireHeight: 6,  spireCols: 3, windowCols: 2, style: 'spired' },
+  { width: 8.0,  depth: 7.5, height: 26, spireHeight: 11, spireCols: 4, windowCols: 3, style: 'spired' },
+  { width: 4.5,  depth: 4.5, height: 12, spireHeight: 5,  spireCols: 2, windowCols: 2, style: 'spired' },
   { width: 10.0, depth: 9.0, height: 36, spireHeight: 15, spireCols: 5, windowCols: 4, style: 'spired' },
-  { width: 6.5, depth: 5.0, height: 13, spireHeight: 0,  spireCols: 0, windowCols: 2, style: 'slab' },
-  { width: 8.5, depth: 5.5, height: 18, spireHeight: 0,  spireCols: 0, windowCols: 3, style: 'slab' },
+  { width: 6.5,  depth: 5.0, height: 13, spireHeight: 0,  spireCols: 0, windowCols: 2, style: 'slab' },
+  { width: 8.5,  depth: 5.5, height: 18, spireHeight: 0,  spireCols: 0, windowCols: 3, style: 'slab' },
 ];
 
 const generatedChunks = new Map();
@@ -657,14 +1077,12 @@ function generateChunk(cx, cz) {
     for (let i = 0; i < TOWERS_PER_CHUNK; i++) {
       const z = cz * CHUNK_SIZE + i * TOWER_SPACING_Z + (rng() - 0.5) * 4;
 
-      /* fileira da frente: encostada na água */
       if (rng() > 0.10) {
         const cfg = towerConfigs[Math.floor(rng() * towerConfigs.length)];
         const x = side * (CHANNEL_WIDTH / 2 + cfg.width / 2 + rng() * 2.5);
         placeTower(chunk, cfg, x, z, rng);
       }
 
-      /* fileira de trás: some na névoa, dá camadas */
       if (rng() > 0.35) {
         const cfg = towerConfigs[Math.floor(rng() * towerConfigs.length)];
         const x = side * (CHANNEL_WIDTH / 2 + BACK_ROW_OFFSET + cfg.width / 2 + rng() * 6);
@@ -682,66 +1100,20 @@ function removeChunk(cx, cz) {
   const chunk = generatedChunks.get(key);
   if (!chunk) return;
   scene.remove(chunk);
-  chunk.traverse(child => {
-    if (child.geometry) child.geometry.dispose(); // materiais são compartilhados: não descartar
-  });
+  chunk.traverse(child => { if (child.geometry) child.geometry.dispose(); });
   generatedChunks.delete(key);
 }
 
-/* ─────────────────────────────────────────────
-   11. CÂMERA & LOOP
-   ───────────────────────────────────────────── */
-const rain = createRainSystem(RAIN_COUNT);
-scene.add(rain.mesh);
-const rainPos = rain.mesh.geometry.attributes.position;
-const rainVel = rain.velocities;
-
-let cameraX = 0;
-let cameraY = 1.8;
-let cameraZ = 30;
-const FORWARD_SPEED = 4.5; // unidades por segundo
+/* ═════════════════════════════════════════════
+   13. LOOP
+   ═════════════════════════════════════════════ */
+let cameraX = 0, cameraY = 2.6, cameraZ = 30;
+const FORWARD_SPEED = 4.2;
 let elapsed = 0;
 
 const clock = new THREE.Clock();
-
-/* mesma função de onda do shader, em JS, para a câmera boiar junto */
-function waveHeightJS(x, z, t) {
-  let h = 0;
-  h += Math.sin(x * 0.09 + t * 0.55) * 0.30;
-  h += Math.sin(z * 0.11 - t * 0.42 + x * 0.03) * 0.22;
-  h += Math.sin(x * 0.23 + z * 0.17 + t * 0.95) * 0.12;
-  h += Math.sin(x * 0.41 - z * 0.33 + t * 1.35) * 0.07;
-  h += Math.sin(z * 0.57 + t * 1.10) * 0.05;
-  return h;
-}
-
-function updateRain(dt) {
-  const a = rainPos.array;
-  for (let i = 0; i < RAIN_COUNT; i++) {
-    const i6 = i * 6;
-    const v = rainVel[i];
-    const dx = RAIN_SLANT * v * dt;
-    const dy = v * dt;
-    const dz = RAIN_SLANT * v * dt * 0.5;
-
-    a[i6]     -= dx; a[i6 + 1] -= dy; a[i6 + 2] -= dz;
-    a[i6 + 3] -= dx; a[i6 + 4] -= dy; a[i6 + 5] -= dz;
-
-    /* recicla ao tocar a água OU ao ficar para trás da câmera */
-    const behind = Math.abs(a[i6 + 2] - cameraZ) > RAIN_SPREAD ||
-                   Math.abs(a[i6] - cameraX) > RAIN_SPREAD;
-    if (a[i6 + 1] < -1 || behind) {
-      const len = 2.0 + Math.random() * 3.0;
-      a[i6]     = cameraX + (Math.random() - 0.5) * RAIN_SPREAD * 1.8;
-      a[i6 + 1] = 60 + Math.random() * 50;
-      a[i6 + 2] = cameraZ + (Math.random() - 0.5) * RAIN_SPREAD * 1.8;
-      a[i6 + 3] = a[i6] - RAIN_SLANT * len;
-      a[i6 + 4] = a[i6 + 1] - len;
-      a[i6 + 5] = a[i6 + 2] - RAIN_SLANT * len * 0.5;
-    }
-  }
-  rainPos.needsUpdate = true;
-}
+const wind = new THREE.Vector2(3.0, 0.6);
+const camPos = new THREE.Vector3();
 
 function updateChunks() {
   const current = Math.floor(cameraZ / CHUNK_SIZE);
@@ -755,7 +1127,6 @@ function updateChunks() {
     }
   }
 }
-
 updateChunks();
 
 function animate() {
@@ -764,33 +1135,39 @@ function animate() {
   const dt = Math.min(clock.getDelta(), 0.05);
   elapsed += dt;
 
+  /* rajadas: a inclinação da chuva muda devagar */
+  wind.set(
+    3.2 + Math.sin(elapsed * 0.11) * 2.4 + Math.sin(elapsed * 0.37) * 0.8,
+    0.5 + Math.cos(elapsed * 0.08) * 1.6
+  );
+
   cameraZ -= FORWARD_SPEED * dt;
   cameraX = Math.sin(elapsed * 0.13) * 1.6;
 
-  /* câmera baixa, quase rente à água, boiando com a onda */
-  const surface = waveHeightJS(cameraX, cameraZ, elapsed);
-  cameraY = 1.75 + surface * 0.45;
+  const h = surfaceHeight(cameraX, cameraZ, elapsed);
+  cameraY = 2.7 + h * 0.55;
 
-  camera.position.set(cameraX, cameraY, cameraZ);
-  camera.lookAt(cameraX * 0.3, cameraY + 1.6, cameraZ - 60);
-  camera.rotation.z = Math.sin(elapsed * 0.21) * 0.012; // rolagem sutil de barco
+  camPos.set(cameraX, cameraY, cameraZ);
+  camera.position.copy(camPos);
+  camera.lookAt(cameraX * 0.3, cameraY + 1.7, cameraZ - 60);
+  camera.rotation.z = Math.sin(elapsed * 0.21) * 0.014;
 
-  water.position.x = cameraX;
-  water.position.z = cameraZ;
+  water.position.set(cameraX, 0, cameraZ);
 
-  waterMat.uniforms.uTime.value = elapsed;
-  updateRain(dt);
+  U.uTime.value = elapsed;
 
-  if (Math.floor(elapsed * 2) !== Math.floor((elapsed - dt) * 2)) {
-    updateChunks();
+  for (const layer of rainLayers) {
+    layer.material.uniforms.uCamPos.value.copy(camPos);
+    layer.material.uniforms.uWind.value.copy(wind);
   }
+
+  updateStorm(dt, camPos);
+
+  if (Math.floor(elapsed * 2) !== Math.floor((elapsed - dt) * 2)) updateChunks();
 
   renderer.render(scene, camera);
 }
 
-/* ─────────────────────────────────────────────
-   12. RESIZE
-   ───────────────────────────────────────────── */
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
