@@ -166,7 +166,7 @@ const SKY_GLSL = `
 
     /* nublado fechado: base escura, bordas claras */
     vec3 cloud = mix(uCloudLight, uCloudDark, dens);
-    cloud += vec3(0.05) * smoothstep(0.70, 0.28, f);
+    cloud += vec3(0.05) * (1.0 - smoothstep(0.28, 0.70, f));
 
     float horizonFade = smoothstep(-0.03, 0.28, dir.y);
     float amount = clamp(uCloudCover * smoothstep(0.10, 0.58, f + 0.22), 0.0, 1.0) * horizonFade;
@@ -203,11 +203,35 @@ const waveUniform = WAVES.map(w => {
   return new THREE.Vector4(d.x, d.y, w.steep, w.len);
 });
 
-const waterVS = `
+/* Gerstner compartilhado: água, espuma e a faixa
+   molhada nas paredes usam exatamente a mesma onda */
+const GERSTNER_GLSL = `
   #define WAVE_COUNT ${WAVES.length}
-  uniform float uTime;
   uniform vec4  uWaves[WAVE_COUNT];
   uniform float uChoppy;
+
+  vec3 gerstnerDisplace(vec2 basePos, float t){
+    vec3 disp = vec3(0.0);
+    for(int i = 0; i < WAVE_COUNT; i++){
+      vec4 w = uWaves[i];
+      vec2 d = normalize(w.xy);
+      float steep = w.z * uChoppy;
+      float k = 6.28318530718 / w.w;
+      float c = sqrt(9.81 / k);
+      float a = steep / k;
+      float f = k * (dot(d, basePos) - c * t);
+      disp += vec3(d.x * a * cos(f), a * sin(f), d.y * a * cos(f));
+    }
+    return disp;
+  }
+  float gerstnerHeight(vec2 basePos, float t){
+    return gerstnerDisplace(basePos, t).y;
+  }
+`;
+
+const waterVS = `
+  uniform float uTime;
+  ${GERSTNER_GLSL}
 
   varying vec3  vWorldPos;
   varying vec3  vNormal;
@@ -240,7 +264,7 @@ const waterVS = `
 
     /* jacobiano < 1 => superfície comprimida => espuma de quebra */
     float J = tangent.x * binormal.z - tangent.z * binormal.x;
-    vFoam = smoothstep(0.92, 0.35, J);
+    vFoam = 1.0 - smoothstep(0.35, 0.92, J);
 
     vHeight   = p.y - base.y;
     vWorldPos = p;
@@ -829,22 +853,334 @@ function playThunder(delay, closeness) {
 const STONE_MAT = new THREE.MeshStandardMaterial({
   vertexColors: true, roughness: 0.95, metalness: 0.02,
 });
+
+/* Pedra procedural injetada no MeshStandardMaterial:
+   aparelho de blocos com fiadas alternadas, grão,
+   escorrido de chuva e faixa molhada que sobe e
+   desce junto com a onda que bate na parede. */
+STONE_MAT.onBeforeCompile = (shader) => {
+  shader.uniforms.uTime   = U.uTime;
+  shader.uniforms.uWaves  = waterMat.uniforms.uWaves;
+  shader.uniforms.uChoppy = waterMat.uniforms.uChoppy;
+
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <common>', '#include <common>\n varying vec3 vWPos;')
+    .replace('#include <begin_vertex>',
+      '#include <begin_vertex>\n vWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;');
+
+  shader.fragmentShader = shader.fragmentShader
+    .replace('#include <common>', `
+      #include <common>
+      varying vec3 vWPos;
+      uniform float uTime;
+      ${NOISE_GLSL}
+      ${GERSTNER_GLSL}
+    `)
+    .replace('#include <roughnessmap_fragment>', `
+      #include <roughnessmap_fragment>
+
+      /* coordenada horizontal contínua ao longo da fachada */
+      float faceH = vWPos.x + vWPos.z;
+
+      float rowF = vWPos.y * 1.15;
+      float row  = floor(rowF);
+      float bond = mod(row, 2.0) * 0.5;          // fiada alternada
+      float colF = faceH * 0.62 + bond;
+
+      float blockRnd = hash21(vec2(floor(colF), row));
+      float grain    = fbm3(vec2(faceH * 3.1, vWPos.y * 3.1));
+
+      float fr = fract(rowF);
+      float fc = fract(colF);
+      float jointH = smoothstep(0.0, 0.055, fr) * (1.0 - smoothstep(0.055, 0.13, fr));
+      float jointV = smoothstep(0.0, 0.05,  fc) * (1.0 - smoothstep(0.05,  0.11, fc));
+      float joint  = max(jointH, jointV * 0.75);
+
+      float tone = 0.84 + 0.28 * blockRnd + 0.18 * (grain - 0.5);
+      tone *= 1.0 - 0.30 * joint;
+
+      /* escorrido vertical de chuva/limo */
+      float streak = fbm3(vec2(faceH * 2.7, vWPos.y * 0.07));
+      tone *= mix(1.0, 0.72, smoothstep(0.42, 0.88, streak));
+
+      /* base mais suja que o topo */
+      tone *= mix(0.70, 1.0, smoothstep(0.0, 10.0, vWPos.y));
+
+      diffuseColor.rgb *= tone;
+
+      /* faixa molhada acompanhando a onda local */
+      if(vWPos.y < 7.0){
+        float wh  = gerstnerHeight(vWPos.xz, uTime);
+        float wet = 1.0 - smoothstep(wh - 0.5, wh + 1.7, vWPos.y);
+        diffuseColor.rgb *= mix(1.0, 0.38, wet);
+        roughnessFactor = mix(roughnessFactor, 0.10, wet);
+      }
+    `);
+};
+
 const WINDOW_MAT = new THREE.MeshBasicMaterial({
   vertexColors: true, side: THREE.DoubleSide, toneMapped: false,
 });
-const FOAM_MAT = new THREE.MeshBasicMaterial({
-  color: 0xdde5e7, transparent: true, opacity: 0.7,
+
+/* halo suave em volta de cada janela acesa */
+const HALO_MAT = new THREE.ShaderMaterial({
+  uniforms: { uFogDensity: U.uFogDensity },
+  vertexShader: `
+    attribute vec3 color;
+    varying vec2 vUv;
+    varying vec3 vTint;
+    varying float vDist;
+    void main(){
+      vUv = uv;
+      vTint = color;
+      vec4 wp = modelMatrix * vec4(position, 1.0);
+      vDist = length(cameraPosition - wp.xyz);
+      gl_Position = projectionMatrix * viewMatrix * wp;
+    }
+  `,
+  fragmentShader: `
+    uniform float uFogDensity;
+    varying vec2 vUv;
+    varying vec3 vTint;
+    varying float vDist;
+    void main(){
+      vec2 d = (vUv - 0.5) * 2.0;
+      float r = length(vec2(d.x, d.y * 0.8));
+      float a = pow(max(1.0 - r, 0.0), 2.6);
+      float fog = 1.0 - exp(-uFogDensity * uFogDensity * vDist * vDist);
+      gl_FragColor = vec4(vTint * a * (1.0 - fog * 0.75), 1.0);
+    }
+  `,
+  transparent: true,
+  blending: THREE.AdditiveBlending,
+  depthWrite: false,
 });
-const FOAM_SOFT_MAT = new THREE.MeshBasicMaterial({
-  color: 0xd0dade, transparent: true, opacity: 0.22, depthWrite: false,
+
+/* ── ESPUMA NA PAREDE ──
+   Anel de malha em volta da base cujos vértices
+   sobem e descem com a MESMA onda da água, com
+   máscara fractal animada: nada de bloco branco. */
+const washVS = `
+  uniform float uTime;
+  ${GERSTNER_GLSL}
+  attribute float aOut;
+  varying float vOut;
+  varying float vWave;
+  varying vec3  vWorld;
+  varying float vDist;
+
+  void main(){
+    vec3 wp = (modelMatrix * vec4(position, 1.0)).xyz;
+    vec3 disp = gerstnerDisplace(wp.xz, uTime);
+    /* +0.07 tira a espuma do mesmo plano da água,
+       senão ela perde o teste de profundidade */
+    wp.y  += disp.y + 0.07;
+    wp.xz += disp.xz * 0.45;
+
+    vOut   = aOut;
+    vWave  = disp.y;
+    vWorld = wp;
+    vDist  = length(cameraPosition - wp);
+    gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
+  }
+`;
+
+const washFS = `
+  uniform float uTime;
+  uniform vec3  uFogColor;
+  uniform float uFogDensity;
+  uniform float uFlash;
+  varying float vOut;
+  varying float vWave;
+  varying vec3  vWorld;
+  varying float vDist;
+  ${NOISE_GLSL}
+
+  void main(){
+    /* duas escalas de turbulência em sentidos opostos */
+    float n1 = fbm3(vWorld.xz * 1.15 - uTime * 0.20);
+    float n2 = fbm3(vWorld.xz * 3.40 + uTime * 0.42);
+
+    /* densa junto à parede, dissolvendo para fora */
+    float band  = 1.0 - smoothstep(0.0, 0.95, vOut);
+    /* a crista empurra a espuma para longe da parede */
+    float runup = smoothstep(-0.5, 0.9, vWave);
+
+    float mask = band * (0.55 + 1.15 * runup);
+    float a = smoothstep(0.16, 0.58, mask * (0.65 + 0.95 * n1) + 0.22 * n2 - 0.08);
+    a *= 1.0 - smoothstep(0.68, 1.0, vOut);
+
+    if(a < 0.01) discard;
+
+    vec3 col = mix(vec3(0.90, 0.94, 0.95), vec3(0.72, 0.79, 0.82), 0.5 - 0.5 * n2);
+    col += vec3(0.5, 0.56, 0.7) * uFlash * 0.5;
+
+    float fog = 1.0 - exp(-uFogDensity * uFogDensity * vDist * vDist);
+    col = mix(col, uFogColor, fog);
+    gl_FragColor = vec4(col, a * (1.0 - fog * 0.6) * 0.92);
+  }
+`;
+
+/* respingo vertical: sobe pela parede quando a crista bate */
+const sprayVS = `
+  uniform float uTime;
+  ${GERSTNER_GLSL}
+  attribute float aUp;
+  varying float vUp;
+  varying float vWave;
+  varying vec3  vWorld;
+  varying float vDist;
+
+  void main(){
+    vec3 wp = (modelMatrix * vec4(position, 1.0)).xyz;
+    float wh = gerstnerHeight(wp.xz, uTime);
+    wp.y = wh - 0.7 + aUp * 3.0;
+
+    vUp    = aUp;
+    vWave  = wh;
+    vWorld = wp;
+    vDist  = length(cameraPosition - wp);
+    gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
+  }
+`;
+
+const sprayFS = `
+  uniform float uTime;
+  uniform vec3  uFogColor;
+  uniform float uFogDensity;
+  uniform float uFlash;
+  varying float vUp;
+  varying float vWave;
+  varying vec3  vWorld;
+  varying float vDist;
+  ${NOISE_GLSL}
+
+  void main(){
+    float n = fbm3(vec2(vWorld.x + vWorld.z, vWorld.y) * 1.8 - uTime * 0.55);
+    float rise = smoothstep(-0.35, 1.0, vWave);          // só com crista alta
+    float fall = pow(1.0 - vUp, 2.0);                    // some para cima
+    float a = smoothstep(0.22, 0.66, fall * rise * (0.6 + 1.1 * n));
+    if(a < 0.01) discard;
+
+    vec3 col = vec3(0.90, 0.94, 0.95) + vec3(0.5, 0.56, 0.7) * uFlash * 0.5;
+    float fog = 1.0 - exp(-uFogDensity * uFogDensity * vDist * vDist);
+    col = mix(col, uFogColor, fog);
+    gl_FragColor = vec4(col, a * (1.0 - fog * 0.6) * 0.8);
+  }
+`;
+
+const WASH_MAT = new THREE.ShaderMaterial({
+  uniforms: Object.assign({}, U), vertexShader: washVS, fragmentShader: washFS,
+  transparent: true, depthWrite: false, side: THREE.DoubleSide,
 });
+WASH_MAT.uniforms.uWaves  = waterMat.uniforms.uWaves;
+WASH_MAT.uniforms.uChoppy = waterMat.uniforms.uChoppy;
+
+const SPRAY_MAT = new THREE.ShaderMaterial({
+  uniforms: Object.assign({}, U), vertexShader: sprayVS, fragmentShader: sprayFS,
+  transparent: true, depthWrite: false, side: THREE.DoubleSide,
+});
+SPRAY_MAT.uniforms.uWaves  = waterMat.uniforms.uWaves;
+SPRAY_MAT.uniforms.uChoppy = waterMat.uniforms.uChoppy;
+
+/* contorno do retângulo com cantos arredondados:
+   cada amostra carrega sua normal para fora */
+function baseOutline(w, d) {
+  const hw = w / 2, hd = d / 2;
+  const pts = [];
+  const push = (x, z, nx, nz) => pts.push({ x, z, nx, nz });
+
+  const side = (x0, z0, x1, z1, nx, nz) => {
+    const len = Math.hypot(x1 - x0, z1 - z0);
+    const n = Math.max(2, Math.round(len / 0.7));
+    for (let i = 0; i < n; i++) {
+      const t = i / n;
+      push(x0 + (x1 - x0) * t, z0 + (z1 - z0) * t, nx, nz);
+    }
+  };
+  const corner = (cx, cz, a0, a1) => {
+    const n = 5;
+    for (let i = 0; i < n; i++) {
+      const a = a0 + (a1 - a0) * (i / n);
+      push(cx, cz, Math.cos(a), Math.sin(a));
+    }
+  };
+
+  const H = Math.PI / 2;
+  side(-hw, hd, hw, hd, 0, 1);      corner( hw,  hd,  H, 0);
+  side(hw, hd, hw, -hd, 1, 0);      corner( hw, -hd,  0, -H);
+  side(hw, -hd, -hw, -hd, 0, -1);   corner(-hw, -hd, -H, -Math.PI);
+  side(-hw, -hd, -hw, hd, -1, 0);   corner(-hw,  hd,  Math.PI, H);
+  return pts;
+}
+
+function buildWashGeometry(w, d) {
+  const outline = baseOutline(w, d);
+  const rings = 7;
+  const outer = 3.2;
+  const n = outline.length;
+
+  const pos = [];
+  const out = [];
+  for (let j = 0; j <= rings; j++) {
+    const tj = j / rings;
+    const r = Math.pow(tj, 1.35) * outer;
+    for (const p of outline) {
+      pos.push(p.x + p.nx * r, 0, p.z + p.nz * r);
+      out.push(tj);
+    }
+  }
+
+  const idx = [];
+  for (let j = 0; j < rings; j++) {
+    for (let i = 0; i < n; i++) {
+      const i2 = (i + 1) % n;
+      const a = j * n + i, b = j * n + i2;
+      const c = (j + 1) * n + i, e = (j + 1) * n + i2;
+      idx.push(a, c, e, a, e, b);
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geo.setAttribute('aOut', new THREE.Float32BufferAttribute(out, 1));
+  geo.setIndex(idx);
+  return geo;
+}
+
+function buildSprayGeometry(w, d) {
+  const outline = baseOutline(w, d);
+  const n = outline.length;
+  const pos = [];
+  const up = [];
+  for (let lvl = 0; lvl < 2; lvl++) {
+    for (const p of outline) {
+      pos.push(p.x + p.nx * 0.35, 0, p.z + p.nz * 0.35);
+      up.push(lvl);
+    }
+  }
+  const idx = [];
+  for (let i = 0; i < n; i++) {
+    const i2 = (i + 1) % n;
+    idx.push(i, n + i, n + i2, i, n + i2, i2);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geo.setAttribute('aUp', new THREE.Float32BufferAttribute(up, 1));
+  geo.setIndex(idx);
+  return geo;
+}
 
 /* claras de propósito: o pipeline converte sRGB → linear,
    então um cinza escuro aqui vira quase preto na tela */
-const C_BODY  = new THREE.Color(0x5c626c);
-const C_SPIRE = new THREE.Color(0x4d535c);
-const C_BAND  = new THREE.Color(0x51575f);
-const C_ROOF  = new THREE.Color(0x555b64);
+const C_BODY   = new THREE.Color(0x5c626c);
+const C_SPIRE  = new THREE.Color(0x4d535c);
+const C_BAND   = new THREE.Color(0x666c75);
+const C_ROOF   = new THREE.Color(0x555b64);
+const C_PIER   = new THREE.Color(0x646a74); // contraforte pega mais luz
+const C_BASE   = new THREE.Color(0x4a505a); // plinto, sempre molhado
+const C_REVEAL = new THREE.Color(0x2b2f36); // fundo do nicho da janela
+const C_HALO   = new THREE.Color(0xa8611e); // brilho somado em volta da janela
 const C_OFF   = new THREE.Color(0x0d0f12);
 
 /* ═════════════════════════════════════════════
@@ -897,35 +1233,102 @@ const WIN_BOTTOM = new THREE.Color(0xff9a2e);
 const windowColorFn = (h) => (c, x, y) =>
   c.copy(WIN_BOTTOM).lerp(WIN_TOP, THREE.MathUtils.clamp(y / h, 0, 1));
 
+/* gablete triangular (frontão) para os topos chapados */
+function gableGeometry(w, h, d) {
+  const shape = new THREE.Shape();
+  shape.moveTo(-w / 2, 0);
+  shape.lineTo(w / 2, 0);
+  shape.lineTo(0, h);
+  shape.lineTo(-w / 2, 0);
+  const geo = new THREE.ExtrudeGeometry(shape, { depth: d, bevelEnabled: false });
+  geo.translate(0, 0, -d / 2);
+  return geo;
+}
+
 function buildTower(cfg, rng) {
   const stoneGeos = [];
   const winGeos = [];
+  const haloGeos = [];
   const m = new THREE.Matrix4();
   const { width, depth, height } = cfg;
   const halfW = width / 2;
   const halfD = depth / 2;
 
+  /* ── plinto: base alargada que entra na água ── */
+  const plinthH = 2.4;
+  pushGeo(stoneGeos, new THREE.BoxGeometry(width + 0.7, plinthH, depth + 0.7),
+    m.makeTranslation(0, plinthH / 2 - 1.2, 0), flat(C_BASE));
+  pushGeo(stoneGeos, new THREE.BoxGeometry(width + 0.35, 0.3, depth + 0.35),
+    m.makeTranslation(0, plinthH - 1.2, 0), flat(C_BAND));
+
+  /* ── corpo ── */
   pushGeo(stoneGeos, new THREE.BoxGeometry(width, height, depth),
     m.makeTranslation(0, height / 2, 0), flat(C_BODY));
 
+  /* ── contrafortes verticais: o relevo que faltava ──
+     tiras salientes entre as colunas de janelas, com
+     capitel piramidal logo abaixo da cornija */
+  const cols = cfg.windowCols;
+  const bCount = cols + 1;
+  const bW = Math.min(0.55, width / (bCount * 2.0));
+  const bDepth = 0.30;
+  const bTop = height * 0.90;
+  const bStepX = bCount > 1 ? (width * 0.90) / (bCount - 1) : 0;
+  const bStepZ = bCount > 1 ? (depth * 0.90) / (bCount - 1) : 0;
+
+  for (let i = 0; i < bCount; i++) {
+    const x = (i - (bCount - 1) / 2) * bStepX;
+    const z = (i - (bCount - 1) / 2) * bStepZ;
+
+    for (const s of [1, -1]) {
+      /* faces frente/trás */
+      pushGeo(stoneGeos, new THREE.BoxGeometry(bW, bTop, bDepth),
+        m.makeTranslation(x, bTop / 2, s * (halfD + bDepth / 2 - 0.02)), flat(C_PIER));
+      pushGeo(stoneGeos, new THREE.ConeGeometry(bW * 0.72, 0.8, 4),
+        m.makeTranslation(x, bTop + 0.4, s * (halfD + bDepth / 2 - 0.02)), flat(C_SPIRE));
+
+      /* faces laterais */
+      pushGeo(stoneGeos, new THREE.BoxGeometry(bDepth, bTop, bW),
+        m.makeTranslation(s * (halfW + bDepth / 2 - 0.02), bTop / 2, z), flat(C_PIER));
+      pushGeo(stoneGeos, new THREE.ConeGeometry(bW * 0.72, 0.8, 4),
+        m.makeTranslation(s * (halfW + bDepth / 2 - 0.02), bTop + 0.4, z), flat(C_SPIRE));
+    }
+  }
+
+  /* ── frisos horizontais ── */
   const bandCount = Math.max(2, Math.round(height / 9));
   for (let i = 0; i < bandCount; i++) {
-    const y = height * (0.18 + (i / bandCount) * 0.72);
-    pushGeo(stoneGeos, new THREE.BoxGeometry(width * 1.03, 0.18, depth * 1.03),
+    const y = height * (0.20 + (i / bandCount) * 0.66);
+    pushGeo(stoneGeos, new THREE.BoxGeometry(width + 0.5, 0.22, depth + 0.5),
       m.makeTranslation(0, y, 0), flat(C_BAND));
   }
 
-  const parapetH = 0.55;
-  pushGeo(stoneGeos, new THREE.BoxGeometry(width * 1.06, parapetH, depth * 1.06),
-    m.makeTranslation(0, height + parapetH / 2, 0), flat(C_ROOF));
-  const roofY = height + parapetH;
+  /* ── cornija dupla com pingadeira ── */
+  pushGeo(stoneGeos, new THREE.BoxGeometry(width + 0.55, 0.35, depth + 0.55),
+    m.makeTranslation(0, height + 0.17, 0), flat(C_ROOF));
+  pushGeo(stoneGeos, new THREE.BoxGeometry(width + 0.95, 0.28, depth + 0.95),
+    m.makeTranslation(0, height + 0.48, 0), flat(C_BAND));
+  const parapetH = 0.6;
+  pushGeo(stoneGeos, new THREE.BoxGeometry(width + 0.2, parapetH, depth + 0.2),
+    m.makeTranslation(0, height + 0.62 + parapetH / 2, 0), flat(C_ROOF));
+  const roofY = height + 0.62 + parapetH;
+
+  /* pináculos nos cantos do parapeito */
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
+    const px = sx * (halfW - 0.1), pz = sz * (halfD - 0.1);
+    pushGeo(stoneGeos, new THREE.BoxGeometry(0.4, 0.5, 0.4),
+      m.makeTranslation(px, roofY + 0.25, pz), flat(C_ROOF));
+    pushGeo(stoneGeos, new THREE.ConeGeometry(0.26, 1.3, 6),
+      m.makeTranslation(px, roofY + 1.15, pz), flat(C_SPIRE));
+  }
 
   if (cfg.style !== 'slab') {
+    /* ── coroa de agulhas: mais numerosas e mais finas ── */
     const nx = cfg.spireCols;
     const nz = depth > 7.5 ? 2 : 1;
-    const stepX = nx > 1 ? (width * 0.80) / (nx - 1) : 0;
-    const stepZ = nz > 1 ? (depth * 0.55) / (nz - 1) : 0;
-    const radius = Math.min(width / nx, depth / nz) * 0.40;
+    const stepX = nx > 1 ? (width * 0.78) / (nx - 1) : 0;
+    const stepZ = nz > 1 ? (depth * 0.50) / (nz - 1) : 0;
+    const radius = Math.min(width / nx, depth / nz) * 0.32;
 
     for (let ix = 0; ix < nx; ix++) {
       for (let iz = 0; iz < nz; iz++) {
@@ -933,99 +1336,121 @@ function buildTower(cfg, rng) {
         const z = (iz - (nz - 1) / 2) * stepZ;
         const half = Math.max((nx - 1) / 2, 0.001);
         const centerBias = 1.0 - Math.abs(ix - (nx - 1) / 2) / half;
-        const sh = cfg.spireHeight * (0.55 + 0.45 * centerBias) * (0.85 + rng() * 0.3);
+        const sh = cfg.spireHeight * (0.50 + 0.50 * centerBias) * (0.85 + rng() * 0.35);
 
-        pushGeo(stoneGeos, new THREE.BoxGeometry(radius * 1.7, 0.6, radius * 1.7),
-          m.makeTranslation(x, roofY + 0.3, z), flat(C_ROOF));
+        /* tambor + colarinho na base da agulha */
+        pushGeo(stoneGeos, new THREE.BoxGeometry(radius * 1.9, 0.7, radius * 1.9),
+          m.makeTranslation(x, roofY + 0.35, z), flat(C_ROOF));
+        pushGeo(stoneGeos, new THREE.BoxGeometry(radius * 2.3, 0.18, radius * 2.3),
+          m.makeTranslation(x, roofY + 0.72, z), flat(C_BAND));
         pushGeo(stoneGeos, new THREE.ConeGeometry(radius, sh, 6),
-          m.makeTranslation(x, roofY + 0.6 + sh / 2, z), flat(C_SPIRE));
+          m.makeTranslation(x, roofY + 0.8 + sh / 2, z), flat(C_SPIRE));
       }
     }
 
-    const tW = Math.min(width, depth) * 0.16;
-    const tH = height * (0.92 + rng() * 0.12);
-    const tSpire = cfg.spireHeight * 1.05;
+    /* ── torretas de canto ── */
+    const tW = Math.min(width, depth) * 0.15;
+    const tH = height * (0.94 + rng() * 0.14);
+    const tSpire = cfg.spireHeight * 1.15;
     const corners = [
-      [-halfW - tW * 0.3, -halfD - tW * 0.3],
-      [ halfW + tW * 0.3, -halfD - tW * 0.3],
-      [-halfW - tW * 0.3,  halfD + tW * 0.3],
-      [ halfW + tW * 0.3,  halfD + tW * 0.3],
+      [-halfW - tW * 0.35, -halfD - tW * 0.35],
+      [ halfW + tW * 0.35, -halfD - tW * 0.35],
+      [-halfW - tW * 0.35,  halfD + tW * 0.35],
+      [ halfW + tW * 0.35,  halfD + tW * 0.35],
     ];
     for (const [tx, tz] of corners) {
       pushGeo(stoneGeos, new THREE.BoxGeometry(tW, tH, tW),
         m.makeTranslation(tx, tH / 2, tz), flat(C_BODY));
-      pushGeo(stoneGeos, new THREE.ConeGeometry(tW * 0.78, tSpire, 6),
-        m.makeTranslation(tx, tH + tSpire / 2, tz), flat(C_SPIRE));
+      pushGeo(stoneGeos, new THREE.BoxGeometry(tW * 1.35, 0.22, tW * 1.35),
+        m.makeTranslation(tx, tH + 0.11, tz), flat(C_BAND));
+      pushGeo(stoneGeos, new THREE.ConeGeometry(tW * 0.72, tSpire, 6),
+        m.makeTranslation(tx, tH + 0.22 + tSpire / 2, tz), flat(C_SPIRE));
     }
   } else {
-    const nBattle = Math.max(3, Math.floor(width / 1.6));
+    /* ── topo chapado: ameias + frontão ── */
+    const nBattle = Math.max(3, Math.floor(width / 1.5));
     const gap = width / nBattle;
     for (let i = 0; i < nBattle; i++) {
       const x = (i - (nBattle - 1) / 2) * gap;
       for (const z of [-halfD, halfD]) {
-        pushGeo(stoneGeos, new THREE.BoxGeometry(gap * 0.55, 0.7, 0.45),
-          m.makeTranslation(x, roofY + 0.35, z), flat(C_ROOF));
+        pushGeo(stoneGeos, new THREE.BoxGeometry(gap * 0.5, 0.75, 0.45),
+          m.makeTranslation(x, roofY + 0.37, z), flat(C_ROOF));
       }
+    }
+    if (rng() > 0.4) {
+      pushGeo(stoneGeos, gableGeometry(width * 0.82, height * 0.16, depth * 0.9),
+        m.makeTranslation(0, roofY, 0), flat(C_ROOF));
     }
   }
 
-  const winW = 0.26, winH = 1.15, rowSpacing = 2.0;
-  const rows = Math.max(2, Math.floor((height - 2.5) / rowSpacing));
-  const cols = cfg.windowCols;
+  /* ── JANELAS: nicho recuado + lanceta + peitoril + halo ── */
+  const winW = 0.28, winH = 1.25, rowSpacing = 2.0;
+  const rows = Math.max(2, Math.floor((height - 3.0) / rowSpacing));
   const colSpacing = (width * 0.62) / Math.max(cols - 1, 1);
   const colorFn = windowColorFn(winH);
   const offFn = flat(C_OFF);
+  const reveal = flat(C_REVEAL);
+
+  /* a lanceta e seu nicho, replicados nas 4 faces */
+  const face = (rot, px, py, pz, nx, nz, scale, lit) => {
+    const sw = winW * scale, sh = winH * scale;
+    const R = (dx, dy, dz) => new THREE.Matrix4().makeRotationY(rot)
+      .setPosition(px + nx * dz, py + dy, pz + nz * dz);
+
+    /* nicho: painel escuro embutido na parede */
+    pushGeo(stoneGeos, new THREE.BoxGeometry(sw * 2.0, sh * 1.35, 0.22),
+      R(0, sh * 0.45, -0.06), reveal);
+    /* peitoril saliente */
+    pushGeo(stoneGeos, new THREE.BoxGeometry(sw * 2.4, 0.14, 0.34),
+      R(0, -0.12, 0.06), flat(C_BAND));
+    /* arco superior */
+    pushGeo(stoneGeos, new THREE.BoxGeometry(sw * 2.3, 0.16, 0.30),
+      R(0, sh * 1.12, 0.04), flat(C_BAND));
+
+    pushGeo(winGeos, lancetShape(sw, sh), R(0, 0, 0.08), lit ? colorFn : offFn);
+
+    if (lit) {
+      const halo = new THREE.PlaneGeometry(sw * 5.5, sh * 2.6);
+      pushGeo(haloGeos, halo, R(0, sh * 0.5, 0.13), flat(C_HALO));
+    }
+  };
 
   for (let row = 0; row < rows; row++) {
-    const y = 2.6 + row * rowSpacing;
-    if (y > height - 1.2) break;
+    const y = 3.0 + row * rowSpacing;
+    if (y > height - 1.6) break;
 
     for (let col = 0; col < cols; col++) {
       const off = (col - (cols - 1) / 2) * colSpacing;
+      const zOff = off * (depth / width);
 
-      pushGeo(winGeos, lancetShape(winW, winH),
-        m.makeTranslation(off, y, halfD + 0.06), rng() > 0.18 ? colorFn : offFn);
-
-      const back = new THREE.Matrix4().makeRotationY(Math.PI).setPosition(-off, y, -halfD - 0.06);
-      pushGeo(winGeos, lancetShape(winW, winH), back, rng() > 0.18 ? colorFn : offFn);
-
+      face(0,          off,  y,  halfD,  0,  1, 1.0, rng() > 0.20);
+      face(Math.PI,   -off,  y, -halfD,  0, -1, 1.0, rng() > 0.20);
       if (width > 6) {
-        const zOff = off * (depth / width);
-        const right = new THREE.Matrix4().makeRotationY(Math.PI / 2).setPosition(halfW + 0.06, y, -zOff);
-        pushGeo(winGeos, lancetShape(winW * 0.9, winH * 0.9), right, rng() > 0.22 ? colorFn : offFn);
-
-        const left = new THREE.Matrix4().makeRotationY(-Math.PI / 2).setPosition(-halfW - 0.06, y, zOff);
-        pushGeo(winGeos, lancetShape(winW * 0.9, winH * 0.9), left, rng() > 0.22 ? colorFn : offFn);
+        face( Math.PI / 2,  halfW, y, -zOff,  1, 0, 0.9, rng() > 0.26);
+        face(-Math.PI / 2, -halfW, y,  zOff, -1, 0, 0.9, rng() > 0.26);
       }
     }
   }
 
   const group = new THREE.Group();
   group.add(new THREE.Mesh(mergeGeometries(stoneGeos), STONE_MAT));
-  if (winGeos.length) group.add(new THREE.Mesh(mergeGeometries(winGeos), WINDOW_MAT));
+  if (winGeos.length)  group.add(new THREE.Mesh(mergeGeometries(winGeos), WINDOW_MAT));
+  if (haloGeos.length) {
+    const haloMesh = new THREE.Mesh(mergeGeometries(haloGeos), HALO_MAT);
+    haloMesh.renderOrder = 5;
+    group.add(haloMesh);
+  }
+
+  /* espuma e respingo acompanham a base da torre */
+  const wash = new THREE.Mesh(buildWashGeometry(width + 0.7, depth + 0.7), WASH_MAT);
+  wash.renderOrder = 6;
+  group.add(wash);
+
+  const spray = new THREE.Mesh(buildSprayGeometry(width + 0.7, depth + 0.7), SPRAY_MAT);
+  spray.renderOrder = 7;
+  group.add(spray);
+
   return group;
-}
-
-/* colar de espuma alto o bastante para as ondas
-   maiores não abrirem fresta na base da parede */
-function createFoamCollar(width, depth) {
-  const g = new THREE.Group();
-
-  const ring = (w, d, thick, h, mat, y) => {
-    const lr = new THREE.BoxGeometry(thick, h, d + thick);
-    const fb = new THREE.BoxGeometry(w + thick, h, thick);
-    const parts = [
-      [new THREE.Mesh(lr, mat), -w / 2, y, 0],
-      [new THREE.Mesh(lr, mat),  w / 2, y, 0],
-      [new THREE.Mesh(fb, mat), 0, y, -d / 2],
-      [new THREE.Mesh(fb, mat), 0, y,  d / 2],
-    ];
-    for (const [mesh, x, my, z] of parts) { mesh.position.set(x, my, z); g.add(mesh); }
-  };
-
-  ring(width, depth, 0.35, 1.3, FOAM_MAT, -0.35);
-  ring(width + 1.0, depth + 1.0, 0.85, 0.8, FOAM_SOFT_MAT, -0.30);
-  return g;
 }
 
 /* ═════════════════════════════════════════════
@@ -1054,16 +1479,28 @@ const towerConfigs = [
 const generatedChunks = new Map();
 const chunkKey = (cx, cz) => `${cx},${cz}`;
 
-function placeTower(chunk, cfg, x, z, rng) {
-  const tower = buildTower(cfg, rng);
+/* As torres agora carregam bem mais geometria, então
+   cada (config, variante) é montada UMA vez e reusada
+   via clone() — clone compartilha geometria e material,
+   o que mantém a geração de chunk barata. */
+const VARIANTS = 4;
+const towerProtos = new Map();
+
+function getTowerProto(cfgIndex, variant) {
+  const key = `${cfgIndex}:${variant}`;
+  let proto = towerProtos.get(key);
+  if (!proto) {
+    proto = buildTower(towerConfigs[cfgIndex], mulberry32(cfgIndex * 7919 + variant * 104729));
+    towerProtos.set(key, proto);
+  }
+  return proto;
+}
+
+function placeTower(chunk, cfgIndex, x, z, rng) {
+  const tower = getTowerProto(cfgIndex, Math.floor(rng() * VARIANTS)).clone();
   tower.position.set(x, 0, z);
   tower.rotation.y = (rng() - 0.5) * 0.12;
   chunk.add(tower);
-
-  const foam = createFoamCollar(cfg.width, cfg.depth);
-  foam.position.set(x, 0, z);
-  foam.rotation.y = tower.rotation.y;
-  chunk.add(foam);
 }
 
 function generateChunk(cx, cz) {
@@ -1078,15 +1515,15 @@ function generateChunk(cx, cz) {
       const z = cz * CHUNK_SIZE + i * TOWER_SPACING_Z + (rng() - 0.5) * 4;
 
       if (rng() > 0.10) {
-        const cfg = towerConfigs[Math.floor(rng() * towerConfigs.length)];
-        const x = side * (CHANNEL_WIDTH / 2 + cfg.width / 2 + rng() * 2.5);
-        placeTower(chunk, cfg, x, z, rng);
+        const ci = Math.floor(rng() * towerConfigs.length);
+        const x = side * (CHANNEL_WIDTH / 2 + towerConfigs[ci].width / 2 + rng() * 2.5);
+        placeTower(chunk, ci, x, z, rng);
       }
 
       if (rng() > 0.35) {
-        const cfg = towerConfigs[Math.floor(rng() * towerConfigs.length)];
-        const x = side * (CHANNEL_WIDTH / 2 + BACK_ROW_OFFSET + cfg.width / 2 + rng() * 6);
-        placeTower(chunk, cfg, x, z + TOWER_SPACING_Z * 0.5, rng);
+        const ci = Math.floor(rng() * towerConfigs.length);
+        const x = side * (CHANNEL_WIDTH / 2 + BACK_ROW_OFFSET + towerConfigs[ci].width / 2 + rng() * 6);
+        placeTower(chunk, ci, x, z + TOWER_SPACING_Z * 0.5, rng);
       }
     }
   }
@@ -1095,12 +1532,12 @@ function generateChunk(cx, cz) {
   generatedChunks.set(key, chunk);
 }
 
+/* geometria é compartilhada com os protótipos: só remover */
 function removeChunk(cx, cz) {
   const key = chunkKey(cx, cz);
   const chunk = generatedChunks.get(key);
   if (!chunk) return;
   scene.remove(chunk);
-  chunk.traverse(child => { if (child.geometry) child.geometry.dispose(); });
   generatedChunks.delete(key);
 }
 
