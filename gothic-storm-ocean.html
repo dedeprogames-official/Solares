@@ -1,0 +1,1352 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Endless Gothic Storm Ocean</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #10151d;
+            font-family: 'Courier New', Courier, monospace;
+        }
+        #canvas-container { width: 100vw; height: 100vh; display: block; }
+        #canvas-container canvas { display: block; }
+        #loading {
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            color: #ffcc00;
+            font-size: 1.2rem;
+            letter-spacing: 2px;
+            pointer-events: none;
+            transition: opacity 0.6s ease;
+        }
+        #hint {
+            position: absolute;
+            bottom: 18px; left: 50%;
+            transform: translateX(-50%);
+            color: rgba(210, 225, 255, 0.55);
+            font-size: 0.72rem;
+            letter-spacing: 2px;
+            pointer-events: none;
+            transition: opacity 0.8s ease;
+        }
+        #error {
+            position: absolute;
+            inset: 0;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 2rem;
+            color: #ff6666;
+            text-align: center;
+            white-space: pre-wrap;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="loading">INITIALIZING STORM SYSTEM...</div>
+    <div id="hint">CLIQUE PARA OUVIR OS TROVÕES</div>
+    <div id="error"></div>
+    <div id="canvas-container"></div>
+
+    <!-- Three.js + post-processing via CDN -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+        import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+        // ==================================================================
+        // Config
+        // ==================================================================
+        const CONFIG = {
+            // Storm twilight palette (matches the reference frame)
+            fogColor: 0x62707f,
+            fogDensity: 0.0040,
+
+            skyTop: 0x232b3a,
+            skyHorizon: 0x7b899d,
+            cloudDark: 0x2b3444,
+            cloudLight: 0x8d9bb0,
+
+            deepColor: 0x0d131b,
+            shallowColor: 0x1c2833,
+            sssColor: 0x2f5c66,
+            foamColor: 0xccd8e4,
+            keyColor: 0x7f92b4,
+            flashColor: 0xc6d8ff,
+
+            // Ocean mesh (radial grid centred on the camera)
+            oceanRings: 180,
+            oceanSegments: 200,
+            oceanInner: 0.6,
+            oceanOuter: 1400,
+            oceanFalloff: 2.9,
+
+            towerCount: 520,
+            towerSpreadX: 130,
+            towerCorridor: 18,
+            spawnAheadMin: 150,
+            spawnAheadMax: 420,
+            recycleBehind: 80,
+
+            foamPerTower: 4,
+
+            rainCount: 11000,
+            rainRadius: 62,
+            rainTop: 58,
+            rainBottom: -16,
+            rainFallSpeed: 48,
+            rainWind: -0.18,
+
+            cameraSpeed: 12,
+            cameraHeight: 8.4,
+
+            bloomStrength: 0.34,
+            bloomRadius: 0.50,
+            bloomThreshold: 0.62
+        };
+
+        // ==================================================================
+        // Renderer / scene / camera
+        // ==================================================================
+        const container = document.getElementById('canvas-container');
+
+        const scene = new THREE.Scene();
+        const fogColorBase = new THREE.Color(CONFIG.fogColor);
+        scene.fog = new THREE.FogExp2(CONFIG.fogColor, CONFIG.fogDensity);
+        scene.background = new THREE.Color(CONFIG.fogColor);
+
+        const camera = new THREE.PerspectiveCamera(58, window.innerWidth / window.innerHeight, 0.1, 4000);
+        camera.position.set(0, CONFIG.cameraHeight, 20);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.75));
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        const EXPOSURE_BASE = 1.10;
+        renderer.toneMappingExposure = EXPOSURE_BASE;
+        container.appendChild(renderer.domElement);
+
+        // ==================================================================
+        // Shared uniforms (referenced by several materials)
+        // ==================================================================
+        const shared = {
+            uTime:       { value: 0 },
+            uFlash:      { value: 0 },
+            uFlashDir:   { value: new THREE.Vector3(0.4, 0.4, -0.82).normalize() },
+            uFlashColor: { value: new THREE.Color(CONFIG.flashColor) },
+            uSkyTop:     { value: new THREE.Color(CONFIG.skyTop) },
+            uSkyHorizon: { value: new THREE.Color(CONFIG.skyHorizon) },
+            uCloudDark:  { value: new THREE.Color(CONFIG.cloudDark) },
+            uCloudLight: { value: new THREE.Color(CONFIG.cloudLight) }
+        };
+
+        // ==================================================================
+        // Shared GLSL: noise + procedural storm sky
+        // ==================================================================
+        const NOISE_GLSL = /* glsl */`
+            float hash21(vec2 p) {
+                vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+                p3 += dot(p3, p3.yzx + 33.33);
+                return fract((p3.x + p3.y) * p3.z);
+            }
+            float vnoise(vec2 p) {
+                vec2 i = floor(p);
+                vec2 f = fract(p);
+                vec2 u = f * f * (3.0 - 2.0 * f);
+                float a = hash21(i);
+                float b = hash21(i + vec2(1.0, 0.0));
+                float c = hash21(i + vec2(0.0, 1.0));
+                float d = hash21(i + vec2(1.0, 1.0));
+                return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+            }
+            const mat2 M2 = mat2(0.80, 0.60, -0.60, 0.80);
+            float fbm2(vec2 p) {
+                float s = 0.0, a = 0.55;
+                for (int i = 0; i < 2; i++) { s += a * vnoise(p); p = M2 * p * 2.03; a *= 0.5; }
+                return s;
+            }
+            float fbm4(vec2 p) {
+                float s = 0.0, a = 0.5;
+                for (int i = 0; i < 4; i++) { s += a * vnoise(p); p = M2 * p * 2.02; a *= 0.5; }
+                return s;
+            }
+        `;
+
+        // skyColor() is used both by the dome and by the ocean reflection.
+        // detail < 0.5 = cheap variant (ocean), detail >= 0.5 = full clouds (dome).
+        const SKY_GLSL = /* glsl */`
+            uniform vec3  uSkyTop;
+            uniform vec3  uSkyHorizon;
+            uniform vec3  uCloudDark;
+            uniform vec3  uCloudLight;
+            uniform vec3  uFlashColor;
+            uniform vec3  uFlashDir;
+            uniform float uFlash;
+            uniform float uTime;
+
+            vec3 skyColor(vec3 d, float detail) {
+                float y = d.y;
+
+                // Base vertical gradient + bright hazy band on the horizon
+                float g = pow(clamp(y * 1.30 + 0.03, 0.0, 1.0), 0.62);
+                vec3 col = mix(uSkyHorizon, uSkyTop, g);
+                col += uSkyHorizon * exp(-max(y, 0.0) * 7.0) * 0.22;
+
+                // Cloud deck projected onto a flat layer -> correct perspective
+                float yy = max(y, 0.020);
+                vec2 p = clamp(d.xz / yy, vec2(-70.0), vec2(70.0));
+                float t = uTime;
+
+                float n1 = fbm4(p * 0.22 + vec2(t * 0.0100, t * 0.0060));
+                float n2, turb;
+                if (detail > 0.5) {
+                    n2   = fbm4(p * 0.62 + vec2(-t * 0.0165, t * 0.0092) + n1 * 0.65);
+                    turb = 1.0 - abs(fbm4(p * 0.36 + vec2(t * 0.0080, -t * 0.0052)) * 2.0 - 1.0);
+                } else {
+                    n2 = n1;
+                    turb = 0.5;
+                }
+
+                float far = 1.0 - smoothstep(14.0, 48.0, length(p));
+                float dens = n1 * 0.78 + n2 * 0.34 * far + turb * 0.24 * far;
+
+                float cover = smoothstep(0.38, 0.90, dens) * smoothstep(0.0, 0.14, y);
+                float lit   = smoothstep(0.26, 0.92, n2 * 0.60 + turb * 0.62);
+
+                vec3 cloudCol = mix(uCloudDark, uCloudLight, lit);
+                // clouds dissolve into the rain haze as they approach the horizon
+                cloudCol = mix(cloudCol, uSkyHorizon * 1.06, exp(-max(y, 0.0) * 5.5) * 0.85);
+                col = mix(col, cloudCol, cover);
+
+                // Lightning scattering inside the deck
+                float a = max(dot(d, normalize(uFlashDir)), 0.0);
+                float glow = pow(a, 250.0) * 5.5
+                           + pow(a, 26.0)  * 1.15
+                           + pow(a, 5.0)   * 0.30
+                           + pow(a, 1.5)   * 0.07;
+                col += uFlashColor * uFlash * glow * (0.30 + cover * 1.55);
+
+                return col;
+            }
+        `;
+
+        // ==================================================================
+        // Gerstner wave field (shared CPU / GPU definition)
+        //
+        // Reference footage is a heavy, slow storm swell: long wavelengths,
+        // low steepness, smooth rolling shoulders. Steep choppy crests read
+        // as "small pond water", so q is kept well under the pinch point.
+        // ==================================================================
+        const GRAV = 9.81;
+        const WAVE_DEFS = [
+            { dir: [ 1.00,  0.22], len: 168.0, amp: 1.50,  q: 0.42 },
+            { dir: [ 0.78, -0.62], len:  97.0, amp: 0.86,  q: 0.38 },
+            { dir: [-0.42,  0.91], len:  58.0, amp: 0.46,  q: 0.34 },
+            { dir: [ 0.90,  0.44], len:  31.0, amp: 0.21,  q: 0.30 },
+            { dir: [-0.80, -0.60], len:  17.0, amp: 0.095, q: 0.26 },
+            { dir: [ 0.25, -0.97], len:   9.0, amp: 0.042, q: 0.22 },
+            { dir: [-0.60,  0.80], len:   5.0, amp: 0.018, q: 0.18 }
+        ];
+        const NW = WAVE_DEFS.length; // 7
+
+        const WAVES = WAVE_DEFS.map(w => {
+            const l = Math.hypot(w.dir[0], w.dir[1]);
+            const dx = w.dir[0] / l;
+            const dz = w.dir[1] / l;
+            const k = (Math.PI * 2) / w.len;
+            const omega = Math.sqrt(GRAV * k) * 0.72; // heavy, viscous storm swell
+            return {
+                dx, dz, k, omega,
+                amp: w.amp,
+                q: w.q,
+                fade0: w.len * 26.0,
+                fade1: w.len * 72.0
+            };
+        });
+        // The two shortest waves contribute almost nothing to positions,
+        // so the CPU mirror skips them.
+        const CPU_WAVES = WAVES.slice(0, 5);
+
+        const waveA = WAVES.map(w => new THREE.Vector4(w.dx, w.dz, w.amp, w.k));
+        const waveB = WAVES.map(w => new THREE.Vector4(w.q, w.omega, w.fade0, w.fade1));
+
+        // CPU evaluation of the same surface (foam, camera bob)
+        const surf = { x: 0, y: 0, z: 0, foam: 0 };
+        function evalSurface(gx, gz, t) {
+            let px = gx, py = 0, pz = gz;
+            let jxx = 0, jzz = 0, jxz = 0;
+            for (let i = 0; i < CPU_WAVES.length; i++) {
+                const w = CPU_WAVES[i];
+                const ph = w.k * (w.dx * gx + w.dz * gz) - w.omega * t;
+                const s = Math.sin(ph), c = Math.cos(ph);
+                const wa = w.k * w.amp;
+                px += w.q * w.amp * w.dx * c;
+                pz += w.q * w.amp * w.dz * c;
+                py += w.amp * s;
+                jxx += w.q * wa * w.dx * w.dx * s;
+                jzz += w.q * wa * w.dz * w.dz * s;
+                jxz += w.q * wa * w.dx * w.dz * s;
+            }
+            const J = (1.0 - jxx) * (1.0 - jzz) - jxz * jxz;
+            surf.x = px; surf.y = py; surf.z = pz;
+            // A low-steepness swell barely compresses, so the crest height
+            // drives the whitecaps and the Jacobian only sharpens them.
+            const crest = Math.min(Math.max((py - 0.85) / 1.20, 0.0), 1.0);
+            surf.foam = Math.min(Math.max((1.0 - J) * 2.6 + crest * 0.85, 0.0), 1.0);
+            return surf;
+        }
+
+        // ==================================================================
+        // Procedural textures
+        // ==================================================================
+        function createWindowTexture() {
+            const size = 512;
+            const cells = 5;
+            const cell = size / cells;
+            const canvas = document.createElement('canvas');
+            canvas.width = canvas.height = size;
+            const ctx = canvas.getContext('2d');
+
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, size, size);
+
+            // Reference windows are punched openings with a lot of dark stone
+            // between them - readable panes, not glowing strips.
+            const inset = cell * 0.30;
+            const w = cell - inset * 2;
+            const h = (cell - inset * 2) * 0.92;
+
+            for (let y = 0; y < cells; y++) {
+                for (let x = 0; x < cells; x++) {
+                    if (Math.random() < 0.30) continue;
+                    const b = 0.32 + Math.random() * 0.46;
+                    const px = x * cell + inset;
+                    const py = y * cell + inset;
+
+                    ctx.fillStyle = `rgba(244, 196, 128, ${b.toFixed(3)})`;
+                    ctx.fillRect(px, py, w, h);
+
+                    ctx.fillStyle = '#000000';
+                    ctx.fillRect(px + w * 0.47, py, w * 0.08, h);
+                }
+            }
+
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+            texture.colorSpace = THREE.SRGBColorSpace;
+            texture.repeat.set(0.11, 0.11); // ExtrudeGeometry UVs are in world units
+            texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+            return texture;
+        }
+
+        function createFoamTexture() {
+            const size = 128;
+            const canvas = document.createElement('canvas');
+            canvas.width = canvas.height = size;
+            const ctx = canvas.getContext('2d');
+
+            const gradient = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+            gradient.addColorStop(0.00, 'rgba(255,255,255,0.80)');
+            gradient.addColorStop(0.35, 'rgba(255,255,255,0.34)');
+            gradient.addColorStop(0.70, 'rgba(255,255,255,0.09)');
+            gradient.addColorStop(1.00, 'rgba(255,255,255,0.0)');
+            ctx.fillStyle = gradient;
+            ctx.fillRect(0, 0, size, size);
+
+            // break the perfect circle so the whitecaps look organic
+            ctx.globalCompositeOperation = 'destination-out';
+            for (let i = 0; i < 26; i++) {
+                const a = Math.random() * Math.PI * 2;
+                const r = size * (0.22 + Math.random() * 0.28);
+                const rad = size * (0.05 + Math.random() * 0.12);
+                ctx.beginPath();
+                ctx.arc(size / 2 + Math.cos(a) * r, size / 2 + Math.sin(a) * r, rad, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(0,0,0,${0.15 + Math.random() * 0.4})`;
+                ctx.fill();
+            }
+            ctx.globalCompositeOperation = 'source-over';
+
+            return new THREE.CanvasTexture(canvas);
+        }
+
+        const windowTexture = createWindowTexture();
+        const foamTexture = createFoamTexture();
+
+        // ==================================================================
+        // Sky dome (storm clouds)
+        // ==================================================================
+        const skyMaterial = new THREE.ShaderMaterial({
+            uniforms: Object.assign({}, shared),
+            side: THREE.BackSide,
+            depthWrite: false,
+            depthTest: false,
+            fog: false,
+            vertexShader: /* glsl */`
+                varying vec3 vDir;
+                void main() {
+                    vDir = position;
+                    gl_Position = projectionMatrix * viewMatrix * modelMatrix * vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: NOISE_GLSL + SKY_GLSL + /* glsl */`
+                varying vec3 vDir;
+                void main() {
+                    vec3 d = normalize(vDir);
+                    gl_FragColor = vec4(skyColor(d, 1.0), 1.0);
+                }
+            `
+        });
+
+        const skyDome = new THREE.Mesh(new THREE.SphereGeometry(10, 48, 28), skyMaterial);
+        skyDome.frustumCulled = false;
+        skyDome.renderOrder = -1000;
+        scene.add(skyDome);
+
+        // ==================================================================
+        // Ocean
+        // ==================================================================
+        function createRadialOceanGeometry(rings, segs, inner, outer, falloff) {
+            const vertexCount = (rings + 1) * (segs + 1);
+            const positions = new Float32Array(vertexCount * 3);
+            const indices = [];
+
+            let v = 0;
+            for (let i = 0; i <= rings; i++) {
+                const t = i / rings;
+                const r = inner + (outer - inner) * Math.pow(t, falloff);
+                // per-ring angular jitter kills the radial "spoke" pattern
+                const off = (i % 2) * (Math.PI / segs);
+                for (let j = 0; j <= segs; j++) {
+                    const a = (j / segs) * Math.PI * 2 + off;
+                    positions[v++] = Math.cos(a) * r;
+                    positions[v++] = 0;
+                    positions[v++] = Math.sin(a) * r;
+                }
+            }
+            for (let i = 0; i < rings; i++) {
+                for (let j = 0; j < segs; j++) {
+                    const a = i * (segs + 1) + j;
+                    const b = a + 1;
+                    const c = a + segs + 1;
+                    const d = c + 1;
+                    indices.push(a, b, c, b, d, c);
+                }
+            }
+
+            const geo = new THREE.BufferGeometry();
+            geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geo.setIndex(indices);
+            return geo;
+        }
+
+        const oceanVertexShader = /* glsl */`
+            #define NW ${NW}
+
+            #include <fog_pars_vertex>
+
+            uniform float uTime;
+            uniform vec4  uWaveA[NW];   // dir.x, dir.y, amplitude, k
+            uniform vec4  uWaveB[NW];   // steepness, omega, lodStart, lodEnd
+
+            varying vec3  vWorldPos;
+            varying vec3  vNormalW;
+            varying float vHeight;
+            varying float vFoam;
+            varying float vDist;
+
+            void main() {
+                vec3 wp = (modelMatrix * vec4(position, 1.0)).xyz;
+                vec2 p = wp.xz;
+                float dist = length(cameraPosition - wp);
+
+                vec3 disp = vec3(0.0);
+                vec3 dPdx = vec3(1.0, 0.0, 0.0);
+                vec3 dPdz = vec3(0.0, 0.0, 1.0);
+                float jxx = 0.0, jzz = 0.0, jxz = 0.0;
+
+                for (int i = 0; i < NW; i++) {
+                    vec2  d   = uWaveA[i].xy;
+                    float amp = uWaveA[i].z;
+                    float k   = uWaveA[i].w;
+                    float q   = uWaveB[i].x;
+                    float om  = uWaveB[i].y;
+
+                    // fade short waves out with distance (anti-aliasing LOD)
+                    amp *= 1.0 - smoothstep(uWaveB[i].z, uWaveB[i].w, dist);
+                    if (amp <= 0.0002) continue;
+
+                    float ph = k * dot(d, p) - om * uTime;
+                    float s = sin(ph);
+                    float c = cos(ph);
+                    float wa = k * amp;
+
+                    // Gerstner: crests get pinched, troughs get wide
+                    disp.x += q * amp * d.x * c;
+                    disp.z += q * amp * d.y * c;
+                    disp.y += amp * s;
+
+                    dPdx.x -= q * wa * d.x * d.x * s;
+                    dPdx.y += wa * d.x * c;
+                    dPdx.z -= q * wa * d.x * d.y * s;
+
+                    dPdz.x -= q * wa * d.x * d.y * s;
+                    dPdz.y += wa * d.y * c;
+                    dPdz.z -= q * wa * d.y * d.y * s;
+
+                    jxx += q * wa * d.x * d.x * s;
+                    jzz += q * wa * d.y * d.y * s;
+                    jxz += q * wa * d.x * d.y * s;
+                }
+
+                wp += disp;
+
+                vHeight   = disp.y;
+                vWorldPos = wp;
+                vDist     = dist;
+                vNormalW  = normalize(cross(dPdz, dPdx));
+
+                // Jacobian < 1 means the surface is compressing: that is where
+                // a real wave breaks into whitecaps.
+                float J = (1.0 - jxx) * (1.0 - jzz) - jxz * jxz;
+                vFoam = clamp((1.0 - J) * 2.6, 0.0, 1.0);
+
+                vec4 mvPosition = viewMatrix * vec4(wp, 1.0);
+                gl_Position = projectionMatrix * mvPosition;
+
+                #include <fog_vertex>
+            }
+        `;
+
+        const oceanFragmentShader = NOISE_GLSL + SKY_GLSL + /* glsl */`
+            #include <fog_pars_fragment>
+
+            uniform vec3 uDeepColor;
+            uniform vec3 uShallowColor;
+            uniform vec3 uSSSColor;
+            uniform vec3 uFoamColor;
+            uniform vec3 uKeyDir;
+            uniform vec3 uKeyColor;
+
+            varying vec3  vWorldPos;
+            varying vec3  vNormalW;
+            varying float vHeight;
+            varying float vFoam;
+            varying float vDist;
+
+            void main() {
+                vec3 V = normalize(cameraPosition - vWorldPos);
+                vec3 N = normalize(vNormalW);
+                vec2 p = vWorldPos.xz;
+
+                // ---- micro detail: capillary ripples + rain impacts --------
+                // Kept subtle: the reference surface is smooth and satiny,
+                // heavy micro normals turn it into crumpled foil.
+                float detFade = 1.0 - smoothstep(18.0, 180.0, vDist);
+                if (detFade > 0.002) {
+                    float e = 0.7;
+                    vec2 fl = vec2(uTime * 0.22, -uTime * 0.14);
+                    float n0 = fbm2(p * 0.20 + fl);
+                    float nx = fbm2((p + vec2(e, 0.0)) * 0.20 + fl);
+                    float nz = fbm2((p + vec2(0.0, e)) * 0.20 + fl);
+
+                    float rainFade = 1.0 - smoothstep(5.0, 42.0, vDist);
+                    vec2 rp = p * 2.4;
+                    float r0 = vnoise(rp + vec2(0.0, uTime * 5.0));
+                    float rx = vnoise(rp + vec2(1.7, uTime * 5.0));
+                    float rz = vnoise(rp + vec2(0.0, uTime * 5.0 + 1.7));
+
+                    vec3 dn = vec3(n0 - nx, 0.0, n0 - nz) * 0.85
+                            + vec3(r0 - rx, 0.0, r0 - rz) * 0.38 * rainFade;
+                    N = normalize(N + dn * detFade);
+                }
+
+                // ---- reflection / refraction split ------------------------
+                vec3 R = reflect(-V, N);
+                R.y = max(R.y, 0.012);
+                vec3 sky = skyColor(normalize(R), 0.0);
+
+                float ndv  = clamp(dot(N, V), 0.0, 1.0);
+                float fres = clamp(0.02 + 0.98 * pow(1.0 - ndv, 5.0), 0.0, 1.0);
+
+                // Water body + subsurface scattering through the wave crests
+                float hN = clamp(vHeight * 0.34 + 0.40, 0.0, 1.0);
+                vec3 body = mix(uDeepColor, uShallowColor, hN);
+                float sss = pow(1.0 - ndv, 2.0) * smoothstep(-0.3, 1.7, vHeight);
+                body += uSSSColor * sss * 0.60;
+                body += uSkyHorizon * 0.035;                    // sky ambient
+                body += uFlashColor * uFlash * 0.10;            // lightning fill
+
+                // The overcast deck is a dim reflector - a full-strength
+                // mirror washes the sea out to pale grey.
+                vec3 col = mix(body, sky * 0.62, fres);
+
+                // ---- specular ---------------------------------------------
+                // Broad, soft sheen instead of hard glitter.
+                vec3 L = normalize(uKeyDir);
+                vec3 H = normalize(L + V);
+                float rough = mix(0.16, 0.52, smoothstep(0.0, 280.0, vDist));
+                float spec = pow(max(dot(N, H), 0.0), mix(180.0, 18.0, rough));
+                col += uKeyColor * spec * 0.30;
+
+                // Lightning glitter path across the swell
+                vec3 Hf = normalize(normalize(uFlashDir) + V);
+                float ndhf = max(dot(N, Hf), 0.0);
+                col += uFlashColor * uFlash * (pow(ndhf, 140.0) * 2.0 + pow(ndhf, 11.0) * 0.20);
+
+                // ---- foam / whitecaps -------------------------------------
+                // Long drifting bands riding the crests, the way the swell
+                // breaks in the reference - not a uniform noise sprinkle.
+                vec2 flow = vec2(uTime * 0.030, uTime * 0.018);
+                float fn  = fbm4(p * 0.040 + flow);
+                float fn2 = fbm2(p * 0.16 - flow * 1.6);
+
+                float crest    = smoothstep(1.25, 2.45, vHeight) * smoothstep(0.48, 0.86, fn);
+                float breaking = smoothstep(0.34, 0.86, vFoam);
+                float foam = clamp(crest * 0.75 + breaking * 0.40, 0.0, 1.0);
+                foam *= 0.60 + 0.45 * fn2;
+                foam *= 1.0 - smoothstep(240.0, 620.0, vDist) * 0.70;
+
+                vec3 foamLit = uFoamColor * (0.52 + 0.30 * fn2) * (1.0 + uFlash * 1.2);
+                col = mix(col, foamLit, foam * 0.40);
+
+                // ---- sea mist lying on the water --------------------------
+                // Replaces the old floating mist planes: it is shaded into the
+                // surface itself, so it can never hover next to the towers.
+                float mistN = fbm4(p * 0.011 + vec2(uTime * 0.010, -uTime * 0.006));
+                float mist  = smoothstep(0.44, 0.98, mistN);
+                mist *= smoothstep(-1.0, 1.1, -vHeight);            // settles in the troughs
+                mist *= smoothstep(14.0, 110.0, vDist);             // never right under the camera
+                mist *= 1.0 - smoothstep(320.0, 720.0, vDist);
+                col = mix(col, uSkyHorizon * 0.88 + uFoamColor * 0.10, mist * 0.32);
+
+                gl_FragColor = vec4(col, 1.0);
+
+                #include <fog_fragment>
+            }
+        `;
+
+        const oceanUniforms = Object.assign(
+            THREE.UniformsUtils.clone(THREE.UniformsLib.fog),
+            shared,
+            {
+                uWaveA:        { value: waveA },
+                uWaveB:        { value: waveB },
+                uDeepColor:    { value: new THREE.Color(CONFIG.deepColor) },
+                uShallowColor: { value: new THREE.Color(CONFIG.shallowColor) },
+                uSSSColor:     { value: new THREE.Color(CONFIG.sssColor) },
+                uFoamColor:    { value: new THREE.Color(CONFIG.foamColor) },
+                uKeyDir:       { value: new THREE.Vector3(0.30, 0.42, 0.86).normalize() },
+                uKeyColor:     { value: new THREE.Color(CONFIG.keyColor) }
+            }
+        );
+
+        const oceanMaterial = new THREE.ShaderMaterial({
+            uniforms: oceanUniforms,
+            vertexShader: oceanVertexShader,
+            fragmentShader: oceanFragmentShader,
+            side: THREE.DoubleSide,
+            fog: true
+        });
+
+        const oceanGeometry = createRadialOceanGeometry(
+            CONFIG.oceanRings, CONFIG.oceanSegments,
+            CONFIG.oceanInner, CONFIG.oceanOuter, CONFIG.oceanFalloff
+        );
+
+        const ocean = new THREE.Mesh(oceanGeometry, oceanMaterial);
+        ocean.frustumCulled = false;
+        scene.add(ocean);
+
+        // NOTE: the three stacked mist planes that used to live here were
+        // removed. Being flat 900x900 quads at y = 5.5 / 10.5 / 17 they cut
+        // straight through the spires and read as translucent slabs floating
+        // in mid-air. The sea mist is now shaded into the ocean surface.
+
+        // ==================================================================
+        // Gothic spires (InstancedMesh)
+        // ==================================================================
+        const TOWER_W = 3.2;
+        const TOWER_H = 34;
+        const TOWER_D = 3.2;
+
+        const towerShape = new THREE.Shape();
+        towerShape.moveTo(-TOWER_W, 0);
+        towerShape.lineTo(-TOWER_W, TOWER_H * 0.55);
+        towerShape.lineTo(-TOWER_W * 0.62, TOWER_H * 0.63);
+        towerShape.lineTo(0, TOWER_H);
+        towerShape.lineTo(TOWER_W * 0.62, TOWER_H * 0.63);
+        towerShape.lineTo(TOWER_W, TOWER_H * 0.55);
+        towerShape.lineTo(TOWER_W, 0);
+        towerShape.closePath();
+
+        const towerGeometry = new THREE.ExtrudeGeometry(towerShape, {
+            depth: TOWER_D * 2,
+            bevelEnabled: false,
+            steps: 1,
+            curveSegments: 1
+        });
+        towerGeometry.translate(0, 0, -TOWER_D);
+
+        const towerMaterial = new THREE.MeshStandardMaterial({
+            color: 0x161c2b,
+            roughness: 0.94,
+            metalness: 0.04,
+            // Warm candle-light behind the glass: dim enough to stay lamps
+            // instead of neon strips.
+            emissive: 0xffd9a8,
+            emissiveMap: windowTexture,
+            emissiveIntensity: 0.80,
+            bumpMap: windowTexture,
+            bumpScale: 0.15
+        });
+
+        const towerMesh = new THREE.InstancedMesh(towerGeometry, towerMaterial, CONFIG.towerCount);
+        towerMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        towerMesh.frustumCulled = false;
+        scene.add(towerMesh);
+
+        // ==================================================================
+        // Foam point system (tower bases)
+        // ==================================================================
+        function makePointSystem(count, size, color, opacityBoost) {
+            const positions = new Float32Array(count * 3);
+            const alphas = new Float32Array(count);
+            const scales = new Float32Array(count);
+
+            const geo = new THREE.BufferGeometry();
+            geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geo.setAttribute('aAlpha', new THREE.BufferAttribute(alphas, 1));
+            geo.setAttribute('aScale', new THREE.BufferAttribute(scales, 1));
+
+            const mat = new THREE.ShaderMaterial({
+                uniforms: {
+                    uMap:        { value: foamTexture },
+                    uColor:      { value: new THREE.Color(color) },
+                    uSize:       { value: size },
+                    uPixelScale: { value: window.innerHeight * 0.5 },
+                    uFogDensity: { value: CONFIG.fogDensity },
+                    uBoost:      { value: opacityBoost },
+                    uFlash:      shared.uFlash,
+                    uFlashColor: shared.uFlashColor
+                },
+                transparent: true,
+                depthWrite: false,
+                blending: THREE.NormalBlending,
+                fog: false,
+                vertexShader: /* glsl */`
+                    attribute float aAlpha;
+                    attribute float aScale;
+                    uniform float uSize, uPixelScale, uFogDensity;
+                    varying float vAlpha;
+                    varying float vFogF;
+                    void main() {
+                        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+                        float d = max(-mv.z, 1.0);
+                        gl_PointSize = uSize * aScale * uPixelScale / d;
+                        gl_Position = projectionMatrix * mv;
+                        vFogF = 1.0 - exp(-uFogDensity * uFogDensity * d * d);
+                        vAlpha = aAlpha;
+                    }
+                `,
+                fragmentShader: /* glsl */`
+                    uniform sampler2D uMap;
+                    uniform vec3 uColor, uFlashColor;
+                    uniform float uFlash, uBoost;
+                    varying float vAlpha;
+                    varying float vFogF;
+                    void main() {
+                        vec4 t = texture2D(uMap, gl_PointCoord);
+                        float a = t.a * vAlpha * uBoost * (1.0 - vFogF);
+                        if (a <= 0.004) discard;
+                        vec3 c = uColor * (1.0 + uFlash * 1.2) + uFlashColor * uFlash * 0.4;
+                        gl_FragColor = vec4(c, a);
+                    }
+                `
+            });
+
+            const points = new THREE.Points(geo, mat);
+            points.frustumCulled = false;
+            points.renderOrder = 3;
+            scene.add(points);
+
+            return { points, geo, mat, positions, alphas, scales, count };
+        }
+
+        // NOTE: the open-sea spray sprites were removed. Round billboards
+        // scattered over the swell read as a field of blobs, nothing like the
+        // long soft streaks in the reference; the whitecaps are shaded into
+        // the ocean surface instead.
+
+        // foam breaking around the tower bases
+        const foamCount = CONFIG.towerCount * CONFIG.foamPerTower;
+        const foam = makePointSystem(foamCount, 3.6, 0xd5e0ec, 0.78);
+        const foamGrid = new Float32Array(foamCount * 2);
+        for (let i = 0; i < foamCount; i++) foam.scales[i] = 0.6 + Math.random() * 1.1;
+        foam.geo.attributes.aScale.needsUpdate = true;
+
+        // ==================================================================
+        // Tower placement / recycling
+        // ==================================================================
+        const dummy = new THREE.Object3D();
+        const towerZ = new Float32Array(CONFIG.towerCount);
+
+        function placeTower(i, z) {
+            let x = (Math.random() - 0.5) * CONFIG.towerSpreadX * 2;
+            if (Math.abs(x) < CONFIG.towerCorridor) {
+                x = (x < 0 ? -1 : 1) * (CONFIG.towerCorridor + Math.random() * 26);
+            }
+
+            const s = 0.5 + Math.random() * 1.05;
+
+            dummy.position.set(x, -1.2, z);
+            dummy.rotation.set(0, Math.random() * Math.PI * 2, 0);
+            dummy.scale.set(s * (0.8 + Math.random() * 0.5), s * (0.75 + Math.random() * 0.7), s * (0.8 + Math.random() * 0.5));
+            dummy.updateMatrix();
+            towerMesh.setMatrixAt(i, dummy.matrix);
+
+            towerZ[i] = z;
+
+            for (let f = 0; f < CONFIG.foamPerTower; f++) {
+                const id = i * CONFIG.foamPerTower + f;
+                const angle = Math.random() * Math.PI * 2;
+                const radius = s * TOWER_W * (0.95 + Math.random() * 1.1);
+                foamGrid[id * 2]     = x + Math.cos(angle) * radius;
+                foamGrid[id * 2 + 1] = z + Math.sin(angle) * radius;
+            }
+        }
+
+        for (let i = 0; i < CONFIG.towerCount; i++) {
+            const t = i / CONFIG.towerCount;
+            const z = camera.position.z + CONFIG.recycleBehind - t * (CONFIG.recycleBehind + CONFIG.spawnAheadMax);
+            placeTower(i, z);
+        }
+        towerMesh.instanceMatrix.needsUpdate = true;
+
+        // ==================================================================
+        // Rain (LineSegments with a per-vertex alpha gradient = motion blur)
+        // ==================================================================
+        const rainVertices = new Float32Array(CONFIG.rainCount * 2 * 3);
+        const rainAlpha = new Float32Array(CONFIG.rainCount * 2);
+        const rainOrigin = new Float32Array(CONFIG.rainCount * 3);
+        const rainLength = new Float32Array(CONFIG.rainCount);
+        const rainSpeed = new Float32Array(CONFIG.rainCount);
+
+        function respawnDrop(i, y) {
+            const angle = Math.random() * Math.PI * 2;
+            const radius = Math.sqrt(Math.random()) * CONFIG.rainRadius;
+            rainOrigin[i * 3]     = camera.position.x + Math.cos(angle) * radius;
+            rainOrigin[i * 3 + 1] = y;
+            rainOrigin[i * 3 + 2] = camera.position.z + Math.sin(angle) * radius;
+            rainLength[i] = 1.8 + Math.random() * 3.6;
+            rainSpeed[i] = 0.78 + Math.random() * 0.5;
+        }
+
+        for (let i = 0; i < CONFIG.rainCount; i++) {
+            respawnDrop(i, camera.position.y + CONFIG.rainBottom + Math.random() * (CONFIG.rainTop - CONFIG.rainBottom));
+            rainAlpha[i * 2]     = 0.95;
+            rainAlpha[i * 2 + 1] = 0.05;
+        }
+
+        const rainGeometry = new THREE.BufferGeometry();
+        rainGeometry.setAttribute('position', new THREE.BufferAttribute(rainVertices, 3));
+        rainGeometry.setAttribute('aAlpha', new THREE.BufferAttribute(rainAlpha, 1));
+
+        const rainMaterial = new THREE.ShaderMaterial({
+            uniforms: {
+                uColor:      { value: new THREE.Color(0xc3d3ee) },
+                uOpacity:    { value: 0.30 },
+                uFogDensity: { value: CONFIG.fogDensity * 1.35 },
+                uFlash:      shared.uFlash
+            },
+            transparent: true,
+            depthWrite: false,
+            blending: THREE.AdditiveBlending,
+            fog: false,
+            vertexShader: /* glsl */`
+                attribute float aAlpha;
+                uniform float uFogDensity;
+                varying float vA;
+                varying float vFogF;
+                void main() {
+                    vec4 mv = modelViewMatrix * vec4(position, 1.0);
+                    float d = max(-mv.z, 0.5);
+                    vFogF = 1.0 - exp(-uFogDensity * uFogDensity * d * d);
+                    vA = aAlpha * (1.0 - smoothstep(2.0, 9.0, d) * 0.35);
+                    gl_Position = projectionMatrix * mv;
+                }
+            `,
+            fragmentShader: /* glsl */`
+                uniform vec3 uColor;
+                uniform float uOpacity, uFlash;
+                varying float vA;
+                varying float vFogF;
+                void main() {
+                    float a = vA * uOpacity * (1.0 - vFogF);
+                    if (a <= 0.002) discard;
+                    gl_FragColor = vec4(uColor * (1.0 + uFlash * 2.2), a);
+                }
+            `
+        });
+
+        const rainSystem = new THREE.LineSegments(rainGeometry, rainMaterial);
+        rainSystem.frustumCulled = false;
+        scene.add(rainSystem);
+
+        // ==================================================================
+        // Lightning bolts (jagged polylines, rebuilt per strike)
+        // ==================================================================
+        const BOLT_MAX_SEGMENTS = 1400;
+        const boltPositions = new Float32Array(BOLT_MAX_SEGMENTS * 2 * 3);
+        const boltGeometry = new THREE.BufferGeometry();
+        boltGeometry.setAttribute('position', new THREE.BufferAttribute(boltPositions, 3));
+        boltGeometry.setDrawRange(0, 0);
+
+        const boltMaterial = new THREE.ShaderMaterial({
+            uniforms: {
+                uColor:   { value: new THREE.Color(0xeaf2ff) },
+                uOpacity: { value: 0.0 }
+            },
+            transparent: true,
+            depthWrite: false,
+            blending: THREE.AdditiveBlending,
+            fog: false,
+            vertexShader: `void main(){ gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+            fragmentShader: `
+                uniform vec3 uColor; uniform float uOpacity;
+                void main(){ if (uOpacity <= 0.002) discard; gl_FragColor = vec4(uColor * 2.2, uOpacity); }
+            `
+        });
+
+        const boltMesh = new THREE.LineSegments(boltGeometry, boltMaterial);
+        boltMesh.frustumCulled = false;
+        scene.add(boltMesh);
+
+        const _v = new THREE.Vector3();
+
+        function buildBolt(dir) {
+            const dist = 260 + Math.random() * 420;
+            const bx = camera.position.x + dir.x * dist;
+            const bz = camera.position.z + dir.z * dist;
+
+            let pts = [
+                new THREE.Vector3(bx, 150 + Math.random() * 90, bz),
+                new THREE.Vector3(bx + (Math.random() - 0.5) * 70, 1.0, bz + (Math.random() - 0.5) * 70)
+            ];
+
+            for (let iter = 0; iter < 6; iter++) {
+                const next = [pts[0]];
+                for (let i = 0; i < pts.length - 1; i++) {
+                    const a = pts[i], b = pts[i + 1];
+                    const m = a.clone().lerp(b, 0.5);
+                    const amp = a.distanceTo(b) * 0.24;
+                    m.x += (Math.random() - 0.5) * amp;
+                    m.z += (Math.random() - 0.5) * amp;
+                    m.y += (Math.random() - 0.5) * amp * 0.25;
+                    next.push(m, b);
+                }
+                pts = next;
+            }
+
+            const segs = [];
+            const pushChannel = (list, thickness) => {
+                for (let o = 0; o < thickness; o++) {
+                    const ox = (o - (thickness - 1) * 0.5) * 0.55;
+                    const oz = (o - (thickness - 1) * 0.5) * 0.55;
+                    for (let i = 0; i < list.length - 1 && segs.length < BOLT_MAX_SEGMENTS; i++) {
+                        segs.push([
+                            list[i].x + ox, list[i].y, list[i].z + oz,
+                            list[i + 1].x + ox, list[i + 1].y, list[i + 1].z + oz
+                        ]);
+                    }
+                }
+            };
+
+            pushChannel(pts, 3);
+
+            // branches
+            const branches = 2 + Math.floor(Math.random() * 4);
+            for (let b = 0; b < branches; b++) {
+                const start = pts[Math.floor(Math.random() * (pts.length - 8)) + 4];
+                let bp = [start.clone(), start.clone().add(_v.set(
+                    (Math.random() - 0.5) * 90,
+                    -(25 + Math.random() * 70),
+                    (Math.random() - 0.5) * 90
+                ))];
+                for (let iter = 0; iter < 4; iter++) {
+                    const next = [bp[0]];
+                    for (let i = 0; i < bp.length - 1; i++) {
+                        const a = bp[i], c = bp[i + 1];
+                        const m = a.clone().lerp(c, 0.5);
+                        const amp = a.distanceTo(c) * 0.3;
+                        m.x += (Math.random() - 0.5) * amp;
+                        m.z += (Math.random() - 0.5) * amp;
+                        m.y += (Math.random() - 0.5) * amp * 0.3;
+                        next.push(m, c);
+                    }
+                    bp = next;
+                }
+                pushChannel(bp, 1);
+            }
+
+            let w = 0;
+            for (let i = 0; i < segs.length; i++) {
+                const s = segs[i];
+                for (let k = 0; k < 6; k++) boltPositions[w++] = s[k];
+            }
+            boltGeometry.attributes.position.needsUpdate = true;
+            boltGeometry.setDrawRange(0, segs.length * 2);
+        }
+
+        // ==================================================================
+        // Storm / lightning scheduler
+        // ==================================================================
+        const storm = {
+            nextAt: 1.5,
+            pulses: [],
+            endsAt: 0,
+            intensity: 0,
+            hasBolt: false,
+            power: 1
+        };
+
+        function scheduleStrike(time) {
+            const az = Math.random() * Math.PI * 2;
+            const el = 0.10 + Math.random() * 0.48;
+            shared.uFlashDir.value.set(
+                Math.cos(az) * Math.cos(el),
+                Math.sin(el),
+                Math.sin(az) * Math.cos(el)
+            ).normalize();
+
+            const near = Math.random();
+            storm.power = 0.40 + near * 0.95;
+            const distance = 320 + (1 - near) * 2800;
+
+            storm.pulses.length = 0;
+            const n = 2 + Math.floor(Math.random() * 4);
+            let t = time;
+            for (let i = 0; i < n; i++) {
+                const amp = (i === 0 ? 1.0 : 0.30 + Math.random() * 0.8) * storm.power;
+                const dur = 0.06 + Math.random() * 0.24;
+                storm.pulses.push({ t0: t, dur, amp });
+                t += dur * (0.35 + Math.random() * 0.6) + Math.random() * 0.10;
+            }
+            storm.endsAt = t;
+
+            storm.hasBolt = near > 0.45 && el < 0.42;
+            if (storm.hasBolt) buildBolt(shared.uFlashDir.value);
+            else boltGeometry.setDrawRange(0, 0);
+
+            playThunder(distance, storm.power);
+
+            storm.nextAt = time + 2.0 + Math.random() * 8.0;
+        }
+
+        function stormIntensity(time) {
+            let v = 0;
+            for (let i = 0; i < storm.pulses.length; i++) {
+                const p = storm.pulses[i];
+                const x = (time - p.t0) / p.dur;
+                if (x < 0.0 || x > 1.0) continue;
+                const attack = Math.min(1.0, x / 0.06);
+                const decay = Math.pow(1.0 - x, 1.7);
+                v += p.amp * attack * decay;
+            }
+            // subtle flicker inside the channel
+            if (v > 0.001) v *= 0.86 + 0.14 * Math.sin(time * 137.0);
+            return Math.min(v, 2.3);
+        }
+
+        // ---- thunder (WebAudio, enabled on the first user gesture) --------
+        let audioCtx = null;
+        const hintEl = document.getElementById('hint');
+
+        function enableAudio() {
+            if (audioCtx) return;
+            try {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                if (audioCtx.state === 'suspended') audioCtx.resume();
+            } catch (e) { audioCtx = null; }
+            if (hintEl) { hintEl.style.opacity = 0; setTimeout(() => hintEl.remove(), 900); }
+        }
+        window.addEventListener('pointerdown', enableAudio, { once: true });
+        window.addEventListener('keydown', enableAudio, { once: true });
+
+        function playThunder(distance, power) {
+            if (!audioCtx) return;
+            try {
+                const sr = audioCtx.sampleRate;
+                const dur = 2.6 + Math.random() * 3.4;
+                const len = Math.floor(sr * dur);
+                const buf = audioCtx.createBuffer(1, len, sr);
+                const data = buf.getChannelData(0);
+
+                let b0 = 0, b1 = 0, b2 = 0;
+                const nearFactor = distance < 900 ? 1.0 : 0.22;
+                for (let i = 0; i < len; i++) {
+                    const w = Math.random() * 2 - 1;
+                    b0 = 0.991 * b0 + w * 0.035;
+                    b1 = 0.963 * b1 + w * 0.055;
+                    b2 = 0.900 * b2 + w * 0.110;
+                    const t = i / sr;
+                    const crack = Math.exp(-t * 6.5) * nearFactor;
+                    const rumble = Math.exp(-t * 0.52) * (0.55 + 0.45 * Math.sin(t * 2.1 + Math.sin(t * 0.63) * 3.4));
+                    data[i] = (b0 + b1 + b2) * (crack * 0.9 + rumble) * 0.42;
+                }
+
+                const src = audioCtx.createBufferSource();
+                src.buffer = buf;
+                const lp = audioCtx.createBiquadFilter();
+                lp.type = 'lowpass';
+                lp.frequency.value = Math.max(160, 2400 - distance * 0.75);
+                lp.Q.value = 0.6;
+                const gain = audioCtx.createGain();
+                gain.gain.value = Math.min(0.85, power * Math.min(1, 950 / distance) * 0.6);
+
+                src.connect(lp); lp.connect(gain); gain.connect(audioCtx.destination);
+                src.start(audioCtx.currentTime + Math.min(9.0, distance / 340));
+            } catch (e) { /* audio is optional */ }
+        }
+
+        // ==================================================================
+        // Lighting
+        // ==================================================================
+        // Dim ambient: the spires should read as near-black gothic silhouettes.
+        const hemi = new THREE.HemisphereLight(0x7c8ba5, 0x0d1119, 0.62);
+        scene.add(hemi);
+
+        const keyLight = new THREE.DirectionalLight(0x8496b8, 0.30);
+        keyLight.position.set(18, 40, 26);
+        scene.add(keyLight);
+
+        const flashLight = new THREE.DirectionalLight(CONFIG.flashColor, 0.0);
+        flashLight.position.set(0, 300, -300);
+        scene.add(flashLight);
+        scene.add(flashLight.target);
+
+        // ==================================================================
+        // Post processing
+        // ==================================================================
+        const composer = new EffectComposer(renderer);
+        composer.setSize(window.innerWidth, window.innerHeight);
+        composer.setPixelRatio(renderer.getPixelRatio());
+
+        composer.addPass(new RenderPass(scene, camera));
+
+        // High threshold + low strength: only the lightning really blooms,
+        // the windows keep a soft halo instead of a neon bleed.
+        const bloomPass = new UnrealBloomPass(
+            new THREE.Vector2(window.innerWidth, window.innerHeight),
+            CONFIG.bloomStrength,
+            CONFIG.bloomRadius,
+            CONFIG.bloomThreshold
+        );
+        composer.addPass(bloomPass);
+
+        composer.addPass(new OutputPass());
+
+        // Final grade: chromatic aberration, contrast, grain, vignette
+        const GradeShader = {
+            uniforms: {
+                tDiffuse: { value: null },
+                uTime:    { value: 0 },
+                uFlash:   { value: 0 }
+            },
+            vertexShader: `
+                varying vec2 vUv;
+                void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }
+            `,
+            fragmentShader: `
+                uniform sampler2D tDiffuse;
+                uniform float uTime, uFlash;
+                varying vec2 vUv;
+                void main() {
+                    vec2 uv = vUv;
+                    vec2 c = uv - 0.5;
+                    float r2 = dot(c, c);
+
+                    float ca = 0.0007 + uFlash * 0.0014;
+                    vec3 col;
+                    col.r = texture2D(tDiffuse, uv + c * ca).r;
+                    col.g = texture2D(tDiffuse, uv).g;
+                    col.b = texture2D(tDiffuse, uv - c * ca).b;
+
+                    float lum = dot(col, vec3(0.299, 0.587, 0.114));
+                    col = mix(vec3(lum), col, 0.94);
+                    col = (col - 0.5) * 1.07 + 0.5;
+                    col += vec3(-0.006, 0.0, 0.016) * (1.0 - smoothstep(0.0, 0.55, lum));
+
+                    float g = fract(sin(dot(uv * vec2(1024.0, 768.0) + uTime, vec2(12.9898, 78.233))) * 43758.5453);
+                    col += (g - 0.5) * 0.022;
+
+                    col *= 1.0 - smoothstep(0.22, 1.0, r2 * 1.85) * 0.55;
+
+                    gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+                }
+            `
+        };
+        const gradePass = new ShaderPass(GradeShader);
+        composer.addPass(gradePass);
+
+        // ==================================================================
+        // Animation loop
+        // ==================================================================
+        const clock = new THREE.Clock();
+        const loadingEl = document.getElementById('loading');
+        let firstFrame = true;
+
+        const flashDirWorld = new THREE.Vector3();
+
+        function animate() {
+            const dt = Math.min(clock.getDelta(), 0.05);
+            const time = clock.getElapsedTime();
+            shared.uTime.value = time;
+
+            // --- Storm / lightning ---------------------------------------
+            if (time >= storm.nextAt) scheduleStrike(time);
+            const target = stormIntensity(time);
+            storm.intensity += (target - storm.intensity) * Math.min(1, dt * 42);
+            if (storm.intensity < 0.0004) storm.intensity = 0;
+            const flash = storm.intensity;
+            shared.uFlash.value = flash;
+
+            boltMaterial.uniforms.uOpacity.value =
+                (storm.hasBolt && time <= storm.endsAt) ? Math.min(1.0, flash * 0.95) : 0.0;
+
+            flashDirWorld.copy(shared.uFlashDir.value);
+            flashLight.position.copy(camera.position).addScaledVector(flashDirWorld, 400);
+            flashLight.target.position.copy(camera.position);
+            flashLight.target.updateMatrixWorld();
+            flashLight.intensity = flash * 2.6;
+
+            hemi.intensity = 0.62 + flash * 1.1;
+            renderer.toneMappingExposure = EXPOSURE_BASE * (1.0 + flash * 0.09);
+            bloomPass.strength = CONFIG.bloomStrength + flash * 0.45;
+
+            // the whole air lights up, so the fog does too
+            scene.fog.color.copy(fogColorBase).lerp(shared.uFlashColor.value, Math.min(0.55, flash * 0.45));
+            scene.background.copy(scene.fog.color);
+
+            gradePass.uniforms.uTime.value = time;
+            gradePass.uniforms.uFlash.value = flash;
+
+            // --- Camera ---------------------------------------------------
+            camera.position.z -= CONFIG.cameraSpeed * dt;
+            camera.position.x = Math.sin(time * 0.31) * 2.6;
+            const bob = evalSurface(camera.position.x, camera.position.z, time).y;
+            camera.position.y = CONFIG.cameraHeight + Math.sin(time * 0.57) * 0.55 + bob * 0.45;
+            camera.rotation.z = Math.sin(time * 0.23) * 0.024;
+            camera.rotation.x = -0.035 + Math.sin(time * 0.41) * 0.012;
+
+            const camX = camera.position.x;
+            const camY = camera.position.y;
+            const camZ = camera.position.z;
+
+            // --- World follows the camera ---------------------------------
+            ocean.position.set(camX, 0, camZ);
+            skyDome.position.copy(camera.position);
+
+            // --- Towers ---------------------------------------------------
+            let instancesDirty = false;
+            for (let i = 0; i < CONFIG.towerCount; i++) {
+                if (towerZ[i] > camZ + CONFIG.recycleBehind) {
+                    const z = camZ - (CONFIG.spawnAheadMin + Math.random() * (CONFIG.spawnAheadMax - CONFIG.spawnAheadMin));
+                    placeTower(i, z);
+                    instancesDirty = true;
+                }
+            }
+            if (instancesDirty) towerMesh.instanceMatrix.needsUpdate = true;
+
+            // --- Foam at the tower bases ----------------------------------
+            for (let i = 0; i < foamCount; i++) {
+                const gx = foamGrid[i * 2];
+                const gz = foamGrid[i * 2 + 1];
+                const s = evalSurface(gx, gz, time);
+                const o = i * 3;
+                foam.positions[o]     = s.x;
+                foam.positions[o + 1] = s.y + 0.22;
+                foam.positions[o + 2] = s.z;
+                foam.alphas[i] = Math.min(1.0, 0.34 + s.foam * 1.0);
+            }
+            foam.geo.attributes.position.needsUpdate = true;
+            foam.geo.attributes.aAlpha.needsUpdate = true;
+
+            // --- Rain -----------------------------------------------------
+            const fall = CONFIG.rainFallSpeed * dt;
+            for (let i = 0; i < CONFIG.rainCount; i++) {
+                const o = i * 3;
+                const drop = fall * rainSpeed[i];
+
+                rainOrigin[o + 1] -= drop;
+                rainOrigin[o] += drop * CONFIG.rainWind;
+
+                if (rainOrigin[o + 1] < camY + CONFIG.rainBottom) {
+                    respawnDrop(i, camY + CONFIG.rainTop);
+                }
+
+                const len = rainLength[i];
+                const v = i * 6;
+                rainVertices[v]     = rainOrigin[o];
+                rainVertices[v + 1] = rainOrigin[o + 1];
+                rainVertices[v + 2] = rainOrigin[o + 2];
+                rainVertices[v + 3] = rainOrigin[o] + len * CONFIG.rainWind;
+                rainVertices[v + 4] = rainOrigin[o + 1] - len;
+                rainVertices[v + 5] = rainOrigin[o + 2];
+            }
+            rainGeometry.attributes.position.needsUpdate = true;
+            rainMaterial.uniforms.uOpacity.value = 0.30 + flash * 0.22;
+
+            composer.render();
+
+            if (firstFrame) {
+                firstFrame = false;
+                loadingEl.style.opacity = 0;
+                setTimeout(() => loadingEl.remove(), 700);
+            }
+        }
+
+        renderer.setAnimationLoop(animate);
+
+        // ==================================================================
+        // Resize
+        // ==================================================================
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+            composer.setPixelRatio(renderer.getPixelRatio());
+            foam.mat.uniforms.uPixelScale.value = window.innerHeight * 0.5;
+        });
+    </script>
+
+    <script>
+        // Surface module/CDN failures instead of leaving a black screen.
+        window.addEventListener('error', (e) => {
+            const el = document.getElementById('error');
+            el.style.display = 'flex';
+            el.textContent = 'FALHA AO INICIAR:\n' + (e.message || e.error);
+            const loading = document.getElementById('loading');
+            if (loading) loading.style.display = 'none';
+        });
+    </script>
+</body>
+</html>
